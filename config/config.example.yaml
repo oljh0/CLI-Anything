@@ -1,0 +1,48 @@
+# CLI-Anything 配置文件示例
+# 使用 `cli-anything init` 自动生成到 ~/.cli-anything/config.yaml
+
+database:
+  path: "~/.cli-anything/tasks.db"
+  wal_mode: true
+  busy_timeout: 5000
+
+terminal:
+  role: "master"              # master 或 worker
+  name: ""                    # 终端显示名称
+  auto_detect: true
+  id: ""                      # 留空则自动生成
+
+mcp_server:
+  transport: "stdio"
+  sse_port: 8000
+  sse_host: "127.0.0.1"
+
+dashboard:
+  port: 8080
+  host: "127.0.0.1"
+  auto_open: true
+  refresh_interval: 5
+
+testing:
+  runner: "pytest"
+  default_args: ["-v", "--tb=short"]
+  timeout: 300
+  auto_run_on_submit: true
+  test_dir: "tests/"
+
+display:
+  color: true
+  table_format: "rich"
+  date_format: "%Y-%m-%d %H:%M"
+
+notification:
+  enabled: false
+  type: "toast"
+  on_status_change: true
+  on_submit: true
+  on_verify: true
+
+aliases:
+  todo: "available"
+  wip: "my --status in_progress"
+  done: "my --status done"

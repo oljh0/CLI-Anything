@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 项目运行时数据（不提交到仓库）
+*.db
+*.db-journal
+*.db-wal
+
+# 测试与覆盖率
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# 日志
+*.log
