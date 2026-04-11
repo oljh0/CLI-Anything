@@ -9,14 +9,14 @@ from textual.reactive import reactive
 from textual.timer import Timer
 from textual import on
 
-from cli_anything.core.models import TaskStatus, TaskType, TerminalRole
+from cli_anything.core.models import TaskStatus, TaskType, TerminalRole, ReviewStatus
 from cli_anything.core.task_manager import TaskManager
 from cli_anything.storage.database import Database
 from cli_anything.utils.config import Config
 
 
 STATUS_ICONS = {
-    "pending": "⏳", "claimed": "🔒", "in_progress": "🔨",
+    "draft": "📝", "pending": "⏳", "claimed": "🔒", "in_progress": "🔨",
     "submitted": "📤", "done": "✅", "rejected": "❌",
     "blocked": "🚫", "cancelled": "🗑️",
 }
@@ -45,10 +45,12 @@ class SummaryPanel(Static):
         done = by_status.get("done", 0)
         in_prog = by_status.get("in_progress", 0)
         pending = by_status.get("pending", 0)
+        draft = by_status.get("draft", 0)
         submitted = by_status.get("submitted", 0)
 
         text = (
             f"📊 总计: {total}  |  "
+            f"📝 草稿: {draft}  |  "
             f"⏳ 待处理: {pending}  |  "
             f"🔨 进行中: {in_prog}  |  "
             f"📤 已提交: {submitted}  |  "
@@ -69,9 +71,16 @@ class TaskTable(Static):
     def compose(self) -> ComposeResult:
         yield DataTable(id="task-table")
 
+    REVIEW_ICONS = {
+        "not_required": "",
+        "pending_review": "🔍",
+        "approved": "✅",
+        "rejected": "🚫",
+    }
+
     def on_mount(self):
         table = self.query_one("#task-table", DataTable)
-        table.add_columns("ID", "状态", "优先", "标题", "类型", "领取者", "测试")
+        table.add_columns("ID", "状态", "优先", "标题", "类型", "领取者", "审阅", "测试")
         table.cursor_type = "row"
         self.refresh_data()
 
@@ -84,6 +93,7 @@ class TaskTable(Static):
             icon = STATUS_ICONS.get(t.status.value, "?")
             pri = PRIORITY_ICONS.get(t.priority, str(t.priority))
             type_label = "📦" if t.task_type == TaskType.MASTER else "  └─"
+            review_icon = self.REVIEW_ICONS.get(t.review_status.value, "") if t.review_status else ""
             table.add_row(
                 t.id,
                 f"{icon} {t.status.value}",
@@ -91,6 +101,7 @@ class TaskTable(Static):
                 t.title[:40],
                 type_label,
                 t.claimed_by or "—",
+                review_icon,
                 t.test_status.value,
                 key=t.id,
             )

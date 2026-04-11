@@ -13,7 +13,7 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 
-from cli_anything.core.models import TaskStatus, TaskType, TestStatus, TerminalRole
+from cli_anything.core.models import TaskStatus, TaskType, TestStatus, ReviewStatus, TerminalRole
 from cli_anything.core.task_manager import TaskManager, TaskManagerError
 from cli_anything.core.terminal_manager import TerminalManager
 from cli_anything.core.test_runner import run_tests_simple
@@ -66,6 +66,7 @@ def _get_term_mgr() -> TerminalManager:
 # ── 状态颜色映射 ────────────────────────────────────────────
 
 STATUS_COLORS = {
+    "draft": "bright_yellow",
     "pending": "yellow",
     "claimed": "cyan",
     "in_progress": "blue",
@@ -77,6 +78,46 @@ STATUS_COLORS = {
 }
 
 PRIORITY_LABELS = {1: "🔴 紧急", 2: "🟠 高", 3: "🟡 中", 4: "🟢 低", 5: "⚪ 最低"}
+
+REVIEW_STATUS_LABELS = {
+    "not_required": "—",
+    "pending_review": "⏳ 待审阅",
+    "approved": "✅ 已通过",
+    "rejected": "❌ 已驳回",
+}
+
+
+def _select_reviewer() -> Optional[str]:
+    """交互式选择审阅者终端"""
+    _init()
+    assert _db is not None
+    terminals = _db.list_terminals()
+    current_id = _term_mgr.current.id if _term_mgr else ""
+
+    # 排除当前终端（不能审阅自己的任务）
+    candidates = [t for t in terminals if t.id != current_id]
+    if not candidates:
+        console.print("[yellow]⚠[/yellow] 没有其他已注册的终端可供选择")
+        return None
+
+    console.print("\n[bold]选择审阅者终端:[/bold]")
+    for i, t in enumerate(candidates, 1):
+        role_badge = "👑" if t.role.value == "master" else "🔧"
+        console.print(f"  {i}. {role_badge} {t.id} ({t.name or '未命名'}) — {t.role.value}")
+    console.print(f"  0. 跳过（不审阅）")
+
+    try:
+        choice = typer.prompt("请输入编号", type=int, default=0)
+        if choice == 0:
+            return None
+        if 1 <= choice <= len(candidates):
+            selected = candidates[choice - 1]
+            console.print(f"  → 已选择: [cyan]{selected.id}[/cyan]")
+            return selected.id
+        console.print("[red]无效的编号[/red]")
+        return None
+    except (ValueError, typer.Abort):
+        return None
 
 
 # ── init 命令 ───────────────────────────────────────────────
@@ -112,13 +153,25 @@ def create(
     desc: str = typer.Option("", "--desc", "-d", help="任务描述"),
     priority: int = typer.Option(3, "--priority", "-p", help="优先级 1-5"),
     tags: Optional[str] = typer.Option(None, "--tags", "-t", help="标签，逗号分隔"),
+    review: bool = typer.Option(False, "--review", "-r", help="创建后发送审阅"),
+    reviewer: Optional[str] = typer.Option(None, "--reviewer", help="指定审阅者终端 ID"),
 ):
     """创建新任务（Master）"""
     tm = _get_tm()
     tag_list = [t.strip() for t in tags.split(",")] if tags else []
+
+    reviewer_id = reviewer
+    if review and not reviewer_id:
+        reviewer_id = _select_reviewer()
+        if not reviewer_id:
+            console.print("[yellow]⚠[/yellow] 未选择审阅者，任务将直接进入 pending 状态")
+
     try:
-        task = tm.create_task(title, desc, priority, tag_list)
-        console.print(f"[green]✓[/green] 任务已创建: [bold]{task.id}[/bold] — {task.title}")
+        task = tm.create_task(title, desc, priority, tag_list, reviewer=reviewer_id)
+        status_label = f"[bright_yellow]draft（待审阅）[/bright_yellow]" if reviewer_id else "[yellow]pending[/yellow]"
+        console.print(f"[green]✓[/green] 任务已创建: [bold]{task.id}[/bold] — {task.title}  {status_label}")
+        if reviewer_id:
+            console.print(f"  📋 审阅者: {reviewer_id}")
     except TaskManagerError as e:
         console.print(f"[red]✗[/red] {e}")
         raise typer.Exit(1)
@@ -128,15 +181,27 @@ def create(
 def decompose(
     parent_id: str = typer.Argument(..., help="父任务 ID"),
     subtasks_json: str = typer.Argument(..., help='子任务 JSON，如 \'[{"title":"子任务1"},{"title":"子任务2"}]\''),
+    review: bool = typer.Option(False, "--review", "-r", help="子任务创建后发送审阅"),
+    reviewer: Optional[str] = typer.Option(None, "--reviewer", help="指定审阅者终端 ID"),
 ):
     """拆解任务为子任务（Master）"""
     tm = _get_tm()
+
+    reviewer_id = reviewer
+    if review and not reviewer_id:
+        reviewer_id = _select_reviewer()
+        if not reviewer_id:
+            console.print("[yellow]⚠[/yellow] 未选择审阅者，子任务将直接进入 pending 状态")
+
     try:
         subs = json.loads(subtasks_json)
-        results = tm.decompose_task(parent_id, subs)
-        console.print(f"[green]✓[/green] 已拆解为 {len(results)} 个子任务:")
+        results = tm.decompose_task(parent_id, subs, reviewer=reviewer_id)
+        status_label = "draft（待审阅）" if reviewer_id else "pending"
+        console.print(f"[green]✓[/green] 已拆解为 {len(results)} 个子任务 [{status_label}]:")
         for s in results:
             console.print(f"  • {s.id} — {s.title}")
+        if reviewer_id:
+            console.print(f"  📋 审阅者: {reviewer_id}")
     except (json.JSONDecodeError, TaskManagerError) as e:
         console.print(f"[red]✗[/red] {e}")
         raise typer.Exit(1)
@@ -194,6 +259,16 @@ def show(task_id: str = typer.Argument(..., help="任务 ID")):
         raise typer.Exit(1)
 
     color = STATUS_COLORS.get(task.status.value, "white")
+    review_line = ""
+    if task.review_status.value != "not_required":
+        review_label = REVIEW_STATUS_LABELS.get(task.review_status.value, task.review_status.value)
+        review_line = (
+            f"\n[bold]审阅状态:[/bold] {review_label}"
+            f"\n[bold]审阅者:[/bold] {task.reviewer or '未指定'}"
+        )
+        if task.review_comment:
+            review_line += f"\n[bold]审阅意见:[/bold] {task.review_comment}"
+
     panel_content = (
         f"[bold]标题:[/bold] {task.title}\n"
         f"[bold]描述:[/bold] {task.description or '无'}\n"
@@ -204,7 +279,8 @@ def show(task_id: str = typer.Argument(..., help="任务 ID")):
         f"[bold]父任务:[/bold] {task.parent_id or '无'}\n"
         f"[bold]创建者:[/bold] {task.created_by}\n"
         f"[bold]领取者:[/bold] {task.claimed_by or '无'}\n"
-        f"[bold]测试状态:[/bold] {task.test_status.value}\n"
+        f"[bold]测试状态:[/bold] {task.test_status.value}"
+        f"{review_line}\n"
         f"[bold]创建时间:[/bold] {task.created_at}\n"
         f"[bold]更新时间:[/bold] {task.updated_at}"
     )
@@ -251,6 +327,61 @@ def start(task_id: str = typer.Argument(..., help="任务 ID")):
     try:
         task = tm.start_task(task_id)
         console.print(f"[blue]▶[/blue] 开始工作: {task.id} — {task.title}")
+    except TaskManagerError as e:
+        console.print(f"[red]✗[/red] {e}")
+        raise typer.Exit(1)
+
+
+# ── 审阅命令 ─────────────────────────────────────────────────
+
+@app.command()
+def review(
+    task_id: str = typer.Argument(..., help="任务 ID"),
+    approve: bool = typer.Option(False, "--approve", "-a", help="通过审阅"),
+    reject: bool = typer.Option(False, "--reject", help="驳回审阅"),
+    comment: str = typer.Option("", "--comment", "-c", help="审阅意见"),
+):
+    """审阅任务定义（draft → pending 或标记驳回）"""
+    if not approve and not reject:
+        console.print("[red]✗[/red] 请指定 --approve 或 --reject")
+        raise typer.Exit(1)
+    if approve and reject:
+        console.print("[red]✗[/red] --approve 和 --reject 不能同时使用")
+        raise typer.Exit(1)
+
+    tm = _get_tm()
+    try:
+        task = tm.review_task(task_id, approved=approve, comment=comment)
+        if approve:
+            console.print(f"[green]✓[/green] 审阅通过: {task.id} — {task.title} → [yellow]pending[/yellow]")
+        else:
+            console.print(f"[red]✗[/red] 审阅驳回: {task.id} — {task.title}")
+        if comment:
+            console.print(f"  💬 意见: {comment}")
+    except TaskManagerError as e:
+        console.print(f"[red]✗[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command(name="resubmit-review")
+def resubmit_review(
+    task_id: str = typer.Argument(..., help="任务 ID"),
+    reviewer: Optional[str] = typer.Option(None, "--reviewer", help="更换审阅者终端 ID"),
+):
+    """重新提交审阅（被驳回后修改再提交）"""
+    tm = _get_tm()
+
+    reviewer_id = reviewer
+    if not reviewer_id:
+        # 交互式选择是否更换审阅者
+        change = typer.confirm("是否更换审阅者?", default=False)
+        if change:
+            reviewer_id = _select_reviewer()
+
+    try:
+        task = tm.resubmit_for_review(task_id, reviewer=reviewer_id)
+        console.print(f"[green]✓[/green] 已重新提交审阅: {task.id} — {task.title}")
+        console.print(f"  📋 审阅者: {task.reviewer}")
     except TaskManagerError as e:
         console.print(f"[red]✗[/red] {e}")
         raise typer.Exit(1)

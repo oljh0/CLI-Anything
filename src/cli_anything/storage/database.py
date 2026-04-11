@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     test_report     TEXT DEFAULT '{}',
     test_path       TEXT DEFAULT '',
     work_dir        TEXT DEFAULT '',
+    reviewer        TEXT DEFAULT NULL,
+    review_status   TEXT DEFAULT 'not_required',
+    review_comment  TEXT DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -98,7 +101,23 @@ class Database:
         # 初始化表结构
         self._conn.executescript(_SCHEMA_SQL)
         self._conn.commit()
+        # 兼容性迁移：为已有数据库添加审阅字段
+        self._migrate_review_columns()
         return self._conn
+
+    def _migrate_review_columns(self):
+        """为已有数据库添加 reviewer/review_status/review_comment 列"""
+        cursor = self.conn.execute("PRAGMA table_info(tasks)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        migrations = [
+            ("reviewer", "TEXT DEFAULT NULL"),
+            ("review_status", "TEXT DEFAULT 'not_required'"),
+            ("review_comment", "TEXT DEFAULT ''"),
+        ]
+        for col_name, col_def in migrations:
+            if col_name not in columns:
+                self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_def}")
+        self.conn.commit()
 
     def close(self):
         """关闭数据库连接"""

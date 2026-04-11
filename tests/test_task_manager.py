@@ -5,7 +5,7 @@ import tempfile
 import pytest
 
 from cli_anything.core.models import (
-    Task, TaskStatus, TaskType, TestStatus, TerminalRole, Terminal
+    Task, TaskStatus, TaskType, TestStatus, ReviewStatus, TerminalRole, Terminal
 )
 from cli_anything.storage.database import Database
 from cli_anything.core.task_manager import TaskManager, TaskManagerError
@@ -187,3 +187,104 @@ class TestTestResult:
         updated = tm.update_test_result(task.id, TestStatus.FAILED, report)
         assert updated.test_status == TestStatus.FAILED
         assert updated.test_report["passed"] == 8
+
+
+class TestReviewWorkflow:
+    """审阅流程测试"""
+
+    def test_create_with_review_enters_draft(self, tm):
+        """指定审阅者时，任务初始状态为 draft"""
+        task = tm.create_task("待审阅任务", reviewer="reviewer-1")
+        assert task.status == TaskStatus.DRAFT
+        assert task.reviewer == "reviewer-1"
+        assert task.review_status == ReviewStatus.PENDING
+
+    def test_create_without_review_enters_pending(self, tm):
+        """不指定审阅者时，任务直接进入 pending"""
+        task = tm.create_task("普通任务")
+        assert task.status == TaskStatus.PENDING
+        assert task.review_status == ReviewStatus.NOT_REQUIRED
+
+    def test_review_approve(self, tm):
+        """审阅通过：draft → pending"""
+        task = tm.create_task("待审阅", reviewer="reviewer-1")
+        reviewed = tm.review_task(task.id, approved=True, comment="看起来不错")
+        assert reviewed.status == TaskStatus.PENDING
+        assert reviewed.review_status == ReviewStatus.APPROVED
+        assert reviewed.review_comment == "看起来不错"
+
+    def test_review_reject(self, tm):
+        """审阅驳回：保持 draft，标记 rejected"""
+        task = tm.create_task("待审阅", reviewer="reviewer-1")
+        reviewed = tm.review_task(task.id, approved=False, comment="描述不清楚")
+        assert reviewed.status == TaskStatus.DRAFT
+        assert reviewed.review_status == ReviewStatus.REJECTED
+        assert reviewed.review_comment == "描述不清楚"
+
+    def test_review_non_draft_raises(self, tm):
+        """审阅非 draft 状态的任务应抛异常"""
+        task = tm.create_task("普通任务")
+        with pytest.raises(TaskManagerError, match="draft"):
+            tm.review_task(task.id, approved=True)
+
+    def test_review_not_required_raises(self, tm):
+        """审阅未要求审阅的任务应抛异常"""
+        task = tm.create_task("普通任务")
+        # 强制改为 draft 但 review_status 是 NOT_REQUIRED
+        task.status = TaskStatus.DRAFT
+        tm.db.update_task(task)
+        with pytest.raises(TaskManagerError, match="未要求审阅"):
+            tm.review_task(task.id, approved=True)
+
+    def test_resubmit_for_review(self, tm):
+        """驳回后重新提交审阅"""
+        task = tm.create_task("待审阅", reviewer="reviewer-1")
+        tm.review_task(task.id, approved=False, comment="需要改进")
+        resubmitted = tm.resubmit_for_review(task.id)
+        assert resubmitted.review_status == ReviewStatus.PENDING
+        assert resubmitted.review_comment == ""
+
+    def test_resubmit_with_new_reviewer(self, tm):
+        """重新提交时更换审阅者"""
+        task = tm.create_task("待审阅", reviewer="reviewer-1")
+        tm.review_task(task.id, approved=False)
+        resubmitted = tm.resubmit_for_review(task.id, reviewer="reviewer-2")
+        assert resubmitted.reviewer == "reviewer-2"
+        assert resubmitted.review_status == ReviewStatus.PENDING
+
+    def test_resubmit_non_rejected_raises(self, tm):
+        """只有被驳回的任务才能重新提交审阅"""
+        task = tm.create_task("待审阅", reviewer="reviewer-1")
+        with pytest.raises(TaskManagerError, match="驳回"):
+            tm.resubmit_for_review(task.id)
+
+    def test_full_review_then_claim_workflow(self, tm):
+        """完整流程：创建(draft) → 审阅通过(pending) → 领取(claimed)"""
+        task = tm.create_task("需审阅的任务", reviewer="reviewer-1")
+        assert task.status == TaskStatus.DRAFT
+
+        # 审阅通过
+        task = tm.review_task(task.id, approved=True, comment="OK")
+        assert task.status == TaskStatus.PENDING
+
+        # 领取
+        task = tm.claim_task(task.id)
+        assert task.status == TaskStatus.CLAIMED
+
+    def test_decompose_with_review(self, tm):
+        """拆解子任务时指定审阅者"""
+        parent = tm.create_task("主任务")
+        subtasks = tm.decompose_task(parent.id, [
+            {"title": "子任务1"}, {"title": "子任务2"}
+        ], reviewer="reviewer-1")
+
+        for s in subtasks:
+            assert s.status == TaskStatus.DRAFT
+            assert s.reviewer == "reviewer-1"
+            assert s.review_status == ReviewStatus.PENDING
+
+    def test_draft_cannot_be_claimed(self, tm):
+        """draft 状态的任务不能被领取"""
+        task = tm.create_task("草稿任务", reviewer="reviewer-1")
+        with pytest.raises(TaskManagerError, match="pending"):
+            tm.claim_task(task.id)

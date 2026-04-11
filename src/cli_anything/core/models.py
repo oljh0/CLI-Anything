@@ -18,6 +18,7 @@ class TaskType(str, Enum):
 
 class TaskStatus(str, Enum):
     """任务状态"""
+    DRAFT = "draft"
     PENDING = "pending"
     CLAIMED = "claimed"
     IN_PROGRESS = "in_progress"
@@ -36,6 +37,14 @@ class TestStatus(str, Enum):
     FAILED = "failed"
 
 
+class ReviewStatus(str, Enum):
+    """审阅状态"""
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending_review"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
 class TerminalRole(str, Enum):
     """终端角色"""
     MASTER = "master"
@@ -44,6 +53,7 @@ class TerminalRole(str, Enum):
 
 # 合法的状态流转表
 VALID_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
+    TaskStatus.DRAFT: {TaskStatus.PENDING, TaskStatus.CANCELLED},
     TaskStatus.PENDING: {TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED},
     TaskStatus.CLAIMED: {TaskStatus.IN_PROGRESS, TaskStatus.PENDING, TaskStatus.CANCELLED},
     TaskStatus.IN_PROGRESS: {TaskStatus.SUBMITTED, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
@@ -87,6 +97,9 @@ class Task:
     test_report: dict = field(default_factory=dict)
     test_path: str = ""
     work_dir: str = ""
+    reviewer: Optional[str] = None
+    review_status: ReviewStatus = ReviewStatus.NOT_REQUIRED
+    review_comment: str = ""
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
 
@@ -96,6 +109,7 @@ class Task:
         d["status"] = self.status.value
         d["task_type"] = self.task_type.value
         d["test_status"] = self.test_status.value
+        d["review_status"] = self.review_status.value
         d["tags"] = json.dumps(self.tags, ensure_ascii=False)
         d["test_report"] = json.dumps(self.test_report, ensure_ascii=False)
         return d
@@ -123,6 +137,9 @@ class Task:
             test_report=json.loads(row.get("test_report", "{}")),
             test_path=row.get("test_path", ""),
             work_dir=row.get("work_dir", ""),
+            reviewer=row.get("reviewer"),
+            review_status=ReviewStatus(row.get("review_status", "not_required")),
+            review_comment=row.get("review_comment", ""),
             created_at=row.get("created_at", ""),
             updated_at=row.get("updated_at", ""),
         )

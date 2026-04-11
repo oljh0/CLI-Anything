@@ -12,6 +12,7 @@ from cli_anything.core.models import (
     TaskStatus,
     TaskType,
     TestStatus,
+    ReviewStatus,
     TerminalRole,
     VALID_TRANSITIONS,
     _new_id,
@@ -41,8 +42,13 @@ class TaskManager:
         tags: Optional[list[str]] = None,
         task_type: TaskType = TaskType.MASTER,
         parent_id: Optional[str] = None,
+        reviewer: Optional[str] = None,
     ) -> Task:
-        """创建新任务"""
+        """创建新任务
+
+        Args:
+            reviewer: 审阅者终端 ID，指定后任务进入 draft 状态等待审阅
+        """
         if not title.strip():
             raise TaskManagerError("任务标题不能为空")
         if priority < 1 or priority > 5:
@@ -52,6 +58,10 @@ class TaskManager:
             if not parent:
                 raise TaskManagerError(f"父任务 {parent_id} 不存在")
 
+        # 如果指定审阅者，初始状态为 draft
+        initial_status = TaskStatus.DRAFT if reviewer else TaskStatus.PENDING
+        review_status = ReviewStatus.PENDING if reviewer else ReviewStatus.NOT_REQUIRED
+
         task = Task(
             title=title.strip(),
             description=description.strip(),
@@ -60,9 +70,15 @@ class TaskManager:
             task_type=task_type,
             parent_id=parent_id,
             created_by=self.terminal_id,
+            status=initial_status,
+            reviewer=reviewer,
+            review_status=review_status,
         )
         self.db.insert_task(task)
-        self._log(task.id, "created", detail=f"创建任务: {title}")
+        detail = f"创建任务: {title}"
+        if reviewer:
+            detail += f"（待 {reviewer} 审阅）"
+        self._log(task.id, "created", detail=detail)
         return task
 
     # ── 任务拆解 ───────────────────────────────────────────
@@ -71,12 +87,14 @@ class TaskManager:
         self,
         parent_id: str,
         subtasks: list[dict],
+        reviewer: Optional[str] = None,
     ) -> list[Task]:
         """将主任务拆解为子任务
 
         Args:
             parent_id: 父任务 ID
             subtasks: 子任务列表，每项为 {"title": str, "description": str, ...}
+            reviewer: 审阅者终端 ID，指定后子任务进入 draft 状态
 
         Returns:
             创建的子任务列表
@@ -94,6 +112,7 @@ class TaskManager:
                 tags=sub.get("tags", parent.tags.copy()),
                 task_type=TaskType.SUBTASK,
                 parent_id=parent_id,
+                reviewer=reviewer,
             )
             results.append(child)
 
@@ -203,6 +222,57 @@ class TaskManager:
             self.db.update_task(task)
             self._log(task_id, "rejected", detail=f"验收驳回: {comment}")
 
+        return task
+
+    # ── 审阅 ────────────────────────────────────────────────
+
+    def review_task(self, task_id: str, approved: bool, comment: str = "") -> Task:
+        """审阅任务定义
+
+        Args:
+            task_id: 任务 ID
+            approved: True=通过(draft→pending), False=驳回(保持 draft，标记 rejected)
+            comment: 审阅意见
+        """
+        task = self._get_or_raise(task_id)
+        if task.status != TaskStatus.DRAFT:
+            raise TaskManagerError("只能审阅 draft 状态的任务")
+        if task.review_status != ReviewStatus.PENDING:
+            raise TaskManagerError("该任务未要求审阅或已审阅完成")
+
+        task.review_comment = comment
+
+        if approved:
+            task.status = TaskStatus.PENDING
+            task.review_status = ReviewStatus.APPROVED
+            self.db.update_task(task)
+            self._log(task_id, "review_approved", detail=f"审阅通过: {comment}")
+        else:
+            task.review_status = ReviewStatus.REJECTED
+            self.db.update_task(task)
+            self._log(task_id, "review_rejected", detail=f"审阅驳回: {comment}")
+
+        return task
+
+    def resubmit_for_review(self, task_id: str, reviewer: Optional[str] = None) -> Task:
+        """重新提交审阅（审阅被驳回后修改再提交）
+
+        Args:
+            task_id: 任务 ID
+            reviewer: 新的审阅者（可选，留空沿用原审阅者）
+        """
+        task = self._get_or_raise(task_id)
+        if task.status != TaskStatus.DRAFT:
+            raise TaskManagerError("只能重新提交 draft 状态的任务")
+        if task.review_status != ReviewStatus.REJECTED:
+            raise TaskManagerError("只能重新提交被驳回的任务")
+
+        if reviewer:
+            task.reviewer = reviewer
+        task.review_status = ReviewStatus.PENDING
+        task.review_comment = ""
+        self.db.update_task(task)
+        self._log(task_id, "review_resubmitted", detail=f"重新提交审阅（审阅者: {task.reviewer}）")
         return task
 
     # ── 测试相关 ───────────────────────────────────────────

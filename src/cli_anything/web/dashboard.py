@@ -9,11 +9,11 @@ import webbrowser
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from cli_anything.core.models import TaskStatus, TaskType
+from cli_anything.core.models import TaskStatus, TaskType, ReviewStatus
 from cli_anything.core.task_manager import TaskManager, TaskManagerError
 from cli_anything.storage.database import Database
 from cli_anything.utils.config import Config
@@ -146,6 +146,34 @@ def api_summary():
     }
 
 
+# ── 审阅 API ────────────────────────────────────────────────
+
+@web_app.post("/api/tasks/{task_id}/review")
+def api_review_task(
+    task_id: str,
+    approved: bool = Body(...),
+    comment: str = Body(""),
+):
+    """审阅任务：通过或驳回"""
+    tm = _get_tm()
+    try:
+        task = tm.review_task(task_id, approved=approved, comment=comment)
+        return task.to_dict()
+    except TaskManagerError as e:
+        return JSONResponse({"error": str(e)}, 400)
+
+
+@web_app.post("/api/tasks/{task_id}/resubmit-review")
+def api_resubmit_review(task_id: str):
+    """重新提交审阅"""
+    tm = _get_tm()
+    try:
+        task = tm.resubmit_for_review(task_id)
+        return task.to_dict()
+    except TaskManagerError as e:
+        return JSONResponse({"error": str(e)}, 400)
+
+
 # ── 前端页面 ────────────────────────────────────────────────
 
 @web_app.get("/", response_class=HTMLResponse)
@@ -229,12 +257,12 @@ header .badge{background:var(--blue);color:#fff;padding:2px 10px;border-radius:1
   <div class="logs" id="logs"></div>
 </div>
 <script>
-const STATUS_COLORS={pending:'var(--yellow)',claimed:'var(--cyan)',in_progress:'var(--blue)',
+const STATUS_COLORS={draft:'var(--orange)',pending:'var(--yellow)',claimed:'var(--cyan)',in_progress:'var(--blue)',
 submitted:'var(--magenta)',done:'var(--green)',rejected:'var(--red)',blocked:'var(--muted)',cancelled:'#666'};
-const STATUS_LABELS={pending:'待处理',claimed:'已领取',in_progress:'进行中',
+const STATUS_LABELS={draft:'草稿',pending:'待处理',claimed:'已领取',in_progress:'进行中',
 submitted:'已提交',done:'已完成',rejected:'已驳回',blocked:'已阻塞',cancelled:'已取消'};
 const PRIORITY_LABELS={1:'🔴',2:'🟠',3:'🟡',4:'🟢',5:'⚪'};
-const KANBAN_ORDER=['pending','claimed','in_progress','submitted','done','rejected'];
+const KANBAN_ORDER=['draft','pending','claimed','in_progress','submitted','done','rejected'];
 
 async function fetchJSON(url){const r=await fetch(url);return r.json()}
 
@@ -244,6 +272,7 @@ async function loadSummary(){
     <div class="summary-card"><div class="num">${d.total_tasks}</div><div class="label">总任务</div></div>
     <div class="summary-card"><div class="num">${d.master_tasks}</div><div class="label">主任务</div></div>
     <div class="summary-card"><div class="num">${d.subtasks}</div><div class="label">子任务</div></div>
+    <div class="summary-card"><div class="num">${d.status_counts.draft||0}</div><div class="label">草稿/审阅中</div></div>
     <div class="summary-card"><div class="num">${d.status_counts.done||0}</div><div class="label">已完成</div></div>
     <div class="summary-card"><div class="num">${d.terminals}</div><div class="label">终端</div></div>
   `;
@@ -260,9 +289,10 @@ async function loadKanban(){
     html+=`<div class="column"><h3><span class="dot" style="background:${color}"></span>${STATUS_LABELS[s]} (${cols[s].length})</h3>`;
     cols[s].forEach(t=>{
       const tags=(JSON.parse(t.tags||'[]')).map(g=>`<span class="tag">${g}</span>`).join('');
+      const reviewer=t.reviewer?`<span class="tag">🔍${t.reviewer}</span>`:'';
       html+=`<div class="task-card priority-${t.priority}">
         <div class="title">${PRIORITY_LABELS[t.priority]||''} ${t.title}</div>
-        <div class="meta"><span>${t.id}</span><span>${t.task_type}</span>${tags}</div>
+        <div class="meta"><span>${t.id}</span><span>${t.task_type}</span>${reviewer}${tags}</div>
       </div>`;
     });
     html+='</div>';
