@@ -4,14 +4,65 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
+import logging
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable, Any
 
 from cli_anything.core.models import Task, TaskLog, Terminal
+
+# 日志记录器
+logger = logging.getLogger(__name__)
+
+
+def retry_on_lock(func: Callable) -> Callable:
+    """数据库操作重试装饰器：遇到锁时自动重试"""
+    def wrapper(*args, **kwargs):
+        delay = INITIAL_RETRY_DELAY
+        last_error = None
+        
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                last_error = e
+                error_msg = str(e).lower()
+                
+                # 只重试锁相关错误
+                if any(keyword in error_msg for keyword in ['locked', 'busy', 'database is locked']):
+                    if attempt < MAX_RETRIES:
+                        logger.warning(
+                            f"数据库锁冲突，{attempt + 1}/{MAX_RETRIES} 次重试，"
+                            f"等待 {delay:.2f}s: {e}"
+                        )
+                        time.sleep(delay)
+                        delay *= 2  # 指数退避
+                    else:
+                        logger.error(f"数据库操作失败，已达最大重试次数: {e}")
+                        raise
+                else:
+                    # 非锁相关错误直接抛出
+                    raise
+        
+        # 理论上不会到这里，但为了类型安全
+        raise last_error
+    
+    return wrapper
 
 
 # 默认数据库路径
 DEFAULT_DB_PATH = os.path.join(os.path.expanduser("~"), ".cli-anything", "tasks.db")
+
+# SQLite 优化配置
+# 连接超时（秒）- 等待获取锁的时间
+SQLITE_CONNECT_TIMEOUT = 15.0
+# busy_timeout（毫秒）- 等待锁的超时时间
+SQLITE_BUSY_TIMEOUT = 15000
+# 最大重试次数
+MAX_RETRIES = 3
+# 初始重试延迟（秒）
+INITIAL_RETRY_DELAY = 0.1
 
 # 建表 SQL
 _SCHEMA_SQL = """
@@ -76,38 +127,51 @@ CREATE TABLE IF NOT EXISTS terminals (
 
 
 class Database:
-    """SQLite 数据库管理器"""
+    """SQLite 数据库管理器（线程安全：每线程独立连接）"""
 
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
-        self._conn: Optional[sqlite3.Connection] = None
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._schema_initialized = False
 
     def connect(self) -> sqlite3.Connection:
-        """建立数据库连接，自动创建目录和表"""
-        if self._conn is not None:
-            return self._conn
+        """获取当前线程的数据库连接，自动创建目录和表"""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            return conn
 
         # 确保目录存在
         db_dir = os.path.dirname(self.db_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
 
-        self._conn = sqlite3.connect(self.db_path, timeout=5.0)
-        self._conn.row_factory = sqlite3.Row
-        # 启用 WAL 模式和外键约束
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        # 初始化表结构
-        self._conn.executescript(_SCHEMA_SQL)
-        self._conn.commit()
-        # 兼容性迁移：为已有数据库添加审阅字段
-        self._migrate_review_columns()
-        return self._conn
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=SQLITE_CONNECT_TIMEOUT,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT}")
+        conn.execute("PRAGMA wal_autocheckpoint=1000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=-64000")
 
-    def _migrate_review_columns(self):
+        # 首次连接时初始化表结构（全局只做一次）
+        with self._lock:
+            if not self._schema_initialized:
+                conn.executescript(_SCHEMA_SQL)
+                conn.commit()
+                self._migrate_review_columns_on(conn)
+                self._schema_initialized = True
+
+        self._local.conn = conn
+        return conn
+
+    def _migrate_review_columns_on(self, conn: sqlite3.Connection):
         """为已有数据库添加 reviewer/review_status/review_comment 列"""
-        cursor = self.conn.execute("PRAGMA table_info(tasks)")
+        cursor = conn.execute("PRAGMA table_info(tasks)")
         columns = {row["name"] for row in cursor.fetchall()}
         migrations = [
             ("reviewer", "TEXT DEFAULT NULL"),
@@ -116,34 +180,69 @@ class Database:
         ]
         for col_name, col_def in migrations:
             if col_name not in columns:
-                self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_def}")
-        self.conn.commit()
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col_name} {col_def}")
+        conn.commit()
+
+    def _migrate_review_columns(self):
+        """兼容旧调用"""
+        self._migrate_review_columns_on(self.conn)
 
     def close(self):
-        """关闭数据库连接"""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        """关闭当前线程的数据库连接"""
+        conn = getattr(self._local, "conn", None)
+        if conn:
+            conn.close()
+            self._local.conn = None
 
     @property
     def conn(self) -> sqlite3.Connection:
-        """获取活跃连接（懒初始化）"""
-        if self._conn is None:
+        """获取当前线程的活跃连接（懒初始化）"""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
             return self.connect()
-        return self._conn
+        return conn
+
+    def execute_in_transaction(self, operations: list[tuple[str, list]]) -> None:
+        """在单个事务中执行多个操作（线程安全）
+        
+        Args:
+            operations: 操作列表，每项为 (sql, params)
+        """
+        with self._lock:
+            try:
+                for sql, params in operations:
+                    self.conn.execute(sql, params)
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    @retry_on_lock
+    def execute_with_retry(self, sql: str, params: list = None) -> sqlite3.Cursor:
+        """执行 SQL 并带锁重试机制"""
+        if params is None:
+            return self.conn.execute(sql)
+        return self.conn.execute(sql, params)
+
+    @retry_on_lock
+    def commit_with_retry(self) -> None:
+        """提交事务并带锁重试机制"""
+        self.conn.commit()
 
     # ── Task CRUD ───────────────────────────────────────────
 
+    @retry_on_lock
     def insert_task(self, task: Task) -> Task:
         """插入新任务"""
-        d = task.to_dict()
-        cols = ", ".join(d.keys())
-        placeholders = ", ".join(["?"] * len(d))
-        self.conn.execute(
-            f"INSERT INTO tasks ({cols}) VALUES ({placeholders})",
-            list(d.values()),
-        )
-        self.conn.commit()
+        with self._lock:
+            d = task.to_dict()
+            cols = ", ".join(d.keys())
+            placeholders = ", ".join(["?"] * len(d))
+            self.conn.execute(
+                f"INSERT INTO tasks ({cols}) VALUES ({placeholders})",
+                list(d.values()),
+            )
+            self.conn.commit()
         return task
 
     def get_task(self, task_id: str) -> Optional[Task]:
@@ -190,18 +289,20 @@ class Database:
         )
         return [Task.from_row(dict(row)) for row in cur.fetchall()]
 
+    @retry_on_lock
     def update_task(self, task: Task) -> Task:
         """更新任务（按 ID）"""
         from datetime import datetime
-        task.updated_at = datetime.now().isoformat(timespec="seconds")
-        d = task.to_dict()
-        task_id = d.pop("id")
-        set_clause = ", ".join(f"{k} = ?" for k in d.keys())
-        self.conn.execute(
-            f"UPDATE tasks SET {set_clause} WHERE id = ?",
-            [*d.values(), task_id],
-        )
-        self.conn.commit()
+        with self._lock:
+            task.updated_at = datetime.now().isoformat(timespec="seconds")
+            d = task.to_dict()
+            task_id = d.pop("id")
+            set_clause = ", ".join(f"{k} = ?" for k in d.keys())
+            self.conn.execute(
+                f"UPDATE tasks SET {set_clause} WHERE id = ?",
+                [*d.values(), task_id],
+            )
+            self.conn.commit()
         return task
 
     def delete_task(self, task_id: str) -> bool:
@@ -220,17 +321,19 @@ class Database:
 
     # ── TaskLog CRUD ────────────────────────────────────────
 
+    @retry_on_lock
     def insert_log(self, log: TaskLog) -> TaskLog:
         """插入操作日志"""
-        d = log.to_dict()
-        cols = ", ".join(d.keys())
-        placeholders = ", ".join(["?"] * len(d))
-        cur = self.conn.execute(
-            f"INSERT INTO task_logs ({cols}) VALUES ({placeholders})",
-            list(d.values()),
-        )
-        self.conn.commit()
-        log.id = cur.lastrowid
+        with self._lock:
+            d = log.to_dict()
+            cols = ", ".join(d.keys())
+            placeholders = ", ".join(["?"] * len(d))
+            cur = self.conn.execute(
+                f"INSERT INTO task_logs ({cols}) VALUES ({placeholders})",
+                list(d.values()),
+            )
+            self.conn.commit()
+            log.id = cur.lastrowid
         return log
 
     def list_logs(
@@ -261,18 +364,20 @@ class Database:
 
     # ── Terminal CRUD ───────────────────────────────────────
 
+    @retry_on_lock
     def upsert_terminal(self, terminal: Terminal) -> Terminal:
         """插入或更新终端信息"""
-        d = terminal.to_dict()
-        cols = ", ".join(d.keys())
-        placeholders = ", ".join(["?"] * len(d))
-        update_set = ", ".join(f"{k} = excluded.{k}" for k in d.keys() if k != "id")
-        self.conn.execute(
-            f"INSERT INTO terminals ({cols}) VALUES ({placeholders}) "
-            f"ON CONFLICT(id) DO UPDATE SET {update_set}",
-            list(d.values()),
-        )
-        self.conn.commit()
+        with self._lock:
+            d = terminal.to_dict()
+            cols = ", ".join(d.keys())
+            placeholders = ", ".join(["?"] * len(d))
+            update_set = ", ".join(f"{k} = excluded.{k}" for k in d.keys() if k != "id")
+            self.conn.execute(
+                f"INSERT INTO terminals ({cols}) VALUES ({placeholders}) "
+                f"ON CONFLICT(id) DO UPDATE SET {update_set}",
+                list(d.values()),
+            )
+            self.conn.commit()
         return terminal
 
     def get_terminal(self, terminal_id: str) -> Optional[Terminal]:

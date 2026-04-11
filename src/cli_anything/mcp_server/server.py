@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Optional
 
 from fastmcp import FastMCP
@@ -18,17 +19,21 @@ mcp = FastMCP("CLI-Anything", instructions="跨终端协同任务系统 MCP Serv
 _db: Database | None = None
 _config: Config | None = None
 _tm: TaskManager | None = None
+_init_lock = threading.Lock()
 
 
 def _init_mcp():
     global _db, _config, _tm
     if _db is not None:
         return
-    _config = Config()
-    _config.load()
-    _db = Database(_config.get("database.path"))
-    _db.connect()
-    _tm = TaskManager(_db, terminal_id="mcp-agent")
+    with _init_lock:
+        if _db is not None:
+            return
+        _config = Config()
+        _config.load()
+        _db = Database(_config.get("database.path"))
+        _db.connect()
+        _tm = TaskManager(_db, terminal_id="mcp-agent")
 
 
 def _get_tm() -> TaskManager:
