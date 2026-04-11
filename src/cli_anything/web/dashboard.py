@@ -102,7 +102,7 @@ async def broadcast(event: str, data: dict):
             await ws.send_text(msg)
         except Exception:
             dead.add(ws)
-    _ws_clients -= dead
+    _ws_clients.difference_update(dead)
 
 
 @web_app.websocket("/ws")
