@@ -88,11 +88,30 @@ class TaskManager:
             reviewer=reviewer,
             review_status=review_status,
         )
-        self.db.insert_task(task)
-        detail = f"创建任务: {title}"
-        if reviewer:
-            detail += f"（待 {reviewer} 审阅）"
-        self._log(task.id, "created", detail=detail)
+        
+        # 使用批量事务同时插入任务和日志，减少锁竞争
+        from datetime import datetime
+        task_dict = task.to_dict()
+        task_cols = ", ".join(task_dict.keys())
+        task_placeholders = ", ".join(["?"] * len(task_dict))
+        
+        log = TaskLog(
+            task_id=task.id,
+            action="created",
+            terminal_id=self.terminal_id,
+            detail=f"创建任务: {title}" + (f"（待 {reviewer} 审阅）" if reviewer else ""),
+        )
+        log_dict = log.to_dict()
+        log_cols = ", ".join(log_dict.keys())
+        log_placeholders = ", ".join(["?"] * len(log_dict))
+        
+        # 在单个事务中执行两个 INSERT
+        operations = [
+            (f"INSERT INTO tasks ({task_cols}) VALUES ({task_placeholders})", list(task_dict.values())),
+            (f"INSERT INTO task_logs ({log_cols}) VALUES ({log_placeholders})", list(log_dict.values())),
+        ]
+        self.db.execute_in_transaction(operations)
+        
         return task
 
     # ── 任务拆解 ───────────────────────────────────────────
