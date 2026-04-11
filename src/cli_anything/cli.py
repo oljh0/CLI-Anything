@@ -626,7 +626,14 @@ def delete(
 @app.command()
 def serve():
     """启动 MCP Server（供 AI Agent 调用）"""
-    console.print("[cyan]🚀 启动 MCP Server...[/cyan]")
+    _init()
+    transport = _config.get("mcp_server.transport", "stdio")
+    if transport == "sse":
+        host = _config.get("mcp_server.sse_host", "127.0.0.1")
+        port = _config.get("mcp_server.sse_port", 8000)
+        console.print(f"[cyan]🚀 启动 MCP Server (SSE): http://{host}:{port}/sse[/cyan]")
+    else:
+        console.print("[cyan]🚀 启动 MCP Server (stdio)...[/cyan]")
     from cli_anything.mcp_server.server import serve as mcp_serve
     mcp_serve()
 

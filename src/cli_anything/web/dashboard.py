@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
+import secrets
 import webbrowser
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Body, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from cli_anything.core.models import TaskStatus, TaskType, ReviewStatus
@@ -23,16 +25,17 @@ from cli_anything.utils.config import Config
 
 _db: Database | None = None
 _tm: TaskManager | None = None
+_config: Config | None = None
 _ws_clients: set[WebSocket] = set()
 
 
 def _init_web():
-    global _db, _tm
+    global _db, _tm, _config
     if _db is not None:
         return
-    config = Config()
-    config.load()
-    _db = Database(config.get("database.path"))
+    _config = Config()
+    _config.load()
+    _db = Database(_config.get("database.path"))
     _db.connect()
     _tm = TaskManager(_db, terminal_id="dashboard")
 
@@ -52,6 +55,40 @@ async def lifespan(app: FastAPI):
 
 
 web_app = FastAPI(title="CLI-Anything Dashboard", lifespan=lifespan)
+
+
+# ── Basic Auth 中间件 ───────────────────────────────────────
+
+_REALM = "CLI-Anything Dashboard"
+_AUTH_DENY = Response(
+    status_code=401,
+    headers={"WWW-Authenticate": f'Basic realm="{_REALM}"'},
+    content="Unauthorized",
+)
+
+
+@web_app.middleware("http")
+async def basic_auth_middleware(request: Request, call_next):
+    """可选的 HTTP Basic Auth 认证中间件"""
+    if _config is None or not _config.get("dashboard.auth.enabled", False):
+        return await call_next(request)
+    # WebSocket 升级请求跳过（浏览器不发 Basic Auth header）
+    if request.headers.get("upgrade", "").lower() == "websocket":
+        return await call_next(request)
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Basic "):
+        return _AUTH_DENY
+    try:
+        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+        username, password = decoded.split(":", 1)
+    except Exception:
+        return _AUTH_DENY
+    expected_user = _config.get("dashboard.auth.username", "admin")
+    expected_pass = _config.get("dashboard.auth.password", "")
+    if not (secrets.compare_digest(username, expected_user)
+            and secrets.compare_digest(password, expected_pass)):
+        return _AUTH_DENY
+    return await call_next(request)
 
 
 # ── WebSocket 广播 ──────────────────────────────────────────

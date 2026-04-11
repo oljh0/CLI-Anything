@@ -493,9 +493,15 @@ def task_health(
 # ── 启动入口 ────────────────────────────────────────────────
 
 def serve():
-    """启动 MCP Server"""
+    """启动 MCP Server（支持 stdio / sse 传输）"""
     _init_mcp()
-    mcp.run()
+    transport = _config.get("mcp_server.transport", "stdio")
+    if transport == "sse":
+        host = _config.get("mcp_server.sse_host", "127.0.0.1")
+        port = _config.get("mcp_server.sse_port", 8000)
+        mcp.run(transport="sse", host=host, port=port)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

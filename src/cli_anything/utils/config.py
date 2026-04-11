@@ -41,6 +41,11 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "host": "127.0.0.1",
         "auto_open": True,
         "refresh_interval": 5,
+        "auth": {
+            "enabled": False,
+            "username": "admin",
+            "password": "",
+        },
     },
     "testing": {
         "runner": "pytest",
