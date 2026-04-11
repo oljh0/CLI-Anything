@@ -860,3 +860,47 @@ curl -X POST http://localhost:8080/api/tasks/task-001/review \
   -H "Content-Type: application/json" \
   -d '{"approved": true, "comment": "LGTM"}'
 ```
+
+---
+
+## 11. 自动化测试
+
+> **测试文件**: `tests/test_dashboard.py`（18 项测试）
+
+### 测试 Fixture
+
+| Fixture | 说明 |
+|---------|------|
+| `db` | 跨线程安全的 SQLite 数据库（`check_same_thread=False`） |
+| `tm` | 绑定测试 DB 的 TaskManager 实例 |
+| `client` | 认证禁用的 FastAPI TestClient |
+| `auth_client` | 认证启用的 FastAPI TestClient（admin/secret123） |
+
+### 测试覆盖
+
+#### Basic Auth 中间件（6 项）
+
+- 认证禁用时请求直接通过
+- 认证启用时无 Header 返回 401
+- 错误密码返回 401
+- 错误用户名返回 401
+- 正确凭据返回 200
+- 无效 Base64 返回 401
+
+#### REST API 端点（12 项）
+
+- GET /api/tasks — 空列表和有数据
+- GET /api/tasks/{id} — 任务详情
+- GET /api/dashboard/summary — 汇总统计
+- POST /api/tasks/{id}/claim — 领取 + 非法领取 400
+- POST /api/tasks/{id}/submit — 提交
+- POST /api/tasks/{id}/verify — 通过/驳回
+- POST /api/tasks/{id}/review — 审阅通过
+- POST /api/tasks/{id}/resubmit-review — 重新提交审阅
+- GET / — 返回 HTML 页面
+
+### 关键实现细节
+
+- 测试 fixture 通过重建 SQLite 连接并设置 `check_same_thread=False` 解决 FastAPI TestClient 的跨线程问题
+- 直接注入模块级全局变量（`dash._db`、`dash._tm`、`dash._config`）绕过 `_init_web()` 初始化
+- Mock Config 通过 `side_effect` 动态返回不同配置值
