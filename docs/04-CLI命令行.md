@@ -1,8 +1,8 @@
 # CLI-Anything — CLI 命令行接口文档
 
-> **源文件**: `src/cli_anything/cli.py`（~721 行）
+> **源文件**: `src/cli_anything/cli.py`（~750 行）
 > **框架**: [Typer](https://typer.tiangolo.com/) + [Rich](https://rich.readthedocs.io/)
-> **入口**: `cli-anything` / `task`（注册于 `pyproject.toml`）
+> **入口**: `cli-anything` / `task`（注册于 `pyproject.toml`，实际入口函数为 `main()`，先执行 `_resolve_aliases()` 别名预处理，再调用 `app()`）
 
 ---
 
@@ -19,6 +19,8 @@
   - [3.2 \_get\_tm()](#32-_get_tm)
   - [3.3 \_get\_term\_mgr()](#33-_get_term_mgr)
   - [3.4 \_select\_reviewer()](#34-_select_reviewer)
+  - [3.5 \_resolve\_aliases()](#35-_resolve_aliases)
+  - [3.6 main()](#36-main)
 - [4. 命令详解（全部 24 个命令）](#4-命令详解全部-24-个命令)
   - [4.1 初始化](#41-初始化)
   - [4.2 任务创建与管理](#42-任务创建与管理)
@@ -147,7 +149,8 @@ def _init():
 1. 创建 `Config` 实例并 `load()` 配置文件
 2. 从配置中读取 `database.path`，创建 `Database` 并 `connect()`
 3. 创建 `TerminalManager`（依赖 `Database` + `Config`）
-4. 创建 `TaskManager`（依赖 `Database` + 当前终端 ID）
+4. 创建 `Notifier`（依赖 `Config`，从配置中读取通知开关）
+5. 创建 `TaskManager`（依赖 `Database` + 当前终端 ID + `Notifier` 实例注入）
 
 **全局变量**：
 
@@ -155,6 +158,7 @@ def _init():
 |------|------|------|
 | `_db` | `Database \| None` | 数据库实例 |
 | `_config` | `Config \| None` | 配置实例 |
+| `_notifier` | `Notifier \| None` | 通知器实例 |
 | `_tm` | `TaskManager \| None` | 任务管理器 |
 | `_term_mgr` | `TerminalManager \| None` | 终端管理器 |
 
@@ -193,6 +197,49 @@ def _select_reviewer() -> Optional[str]:
 5. 输入 `0` 或无效编号则跳过
 
 **返回值**：选中终端的 ID 字符串，或 `None`（跳过）。
+
+### 3.5 _resolve_aliases()
+
+```python
+def _resolve_aliases():
+    """从配置文件的 aliases 段解析命令别名"""
+```
+
+**功能**：在 Typer 处理命令行参数之前，将用户输入的别名替换为实际命令。
+
+**逻辑流程**：
+
+1. 加载 `Config` 读取 `aliases` 配置段
+2. 检查 `sys.argv[1]` 是否匹配某个别名
+3. 如果匹配，将别名展开（支持带参数的别名，如 `wip` → `my --status in_progress`）
+4. 替换 `sys.argv[1:2]` 为展开后的参数列表
+
+**别名示例**（来自 `config.yaml`）：
+
+| 别名 | 展开为 | 效果 |
+|------|--------|------|
+| `todo` | `available` | `task todo` → `task available` |
+| `wip` | `my --status in_progress` | `task wip` → `task my --status in_progress` |
+| `done` | `my --status done` | `task done` → `task my --status done` |
+
+**容错设计**：整个函数包裹在 `try/except` 中，别名解析失败不影响正常命令执行。
+
+### 3.6 main()
+
+```python
+def main():
+    """程序入口函数（pyproject.toml 注册的实际入口点）"""
+```
+
+**功能**：先执行别名预处理，再启动 Typer 应用。
+
+**调用链**：
+
+```
+pyproject.toml → main() → _resolve_aliases() → app()
+```
+
+**为什么需要 main()**：Typer 的 `app()` 直接处理 `sys.argv`，不支持在命令解析前进行自定义预处理。通过 `main()` 作为中间层，可以在 Typer 解析参数前完成别名替换。
 
 ---
 
@@ -877,6 +924,14 @@ stateDiagram-v2
 ### 8.6 确认提示保护
 
 `delete` 和 `submit`（测试失败时）等破坏性操作均有确认提示，可通过 `--force` 或确认跳过。
+
+### 8.7 Notifier 构造注入
+
+通过 `_init()` 创建 `Notifier` 实例并注入 `TaskManager`，实现通知与业务逻辑的松耦合。通知开关由配置文件控制，默认关闭。
+
+### 8.8 别名预处理
+
+通过 `main()` → `_resolve_aliases()` 在 Typer 解析参数前完成别名替换，支持用户自定义快捷命令。采用 `try/except` 容错，确保别名配置错误不影响正常命令使用。
 
 ---
 

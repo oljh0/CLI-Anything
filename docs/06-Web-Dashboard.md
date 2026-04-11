@@ -26,8 +26,11 @@
   - [4.4 GET /api/tasks/{task\_id}/logs — 任务日志](#44-get-apitaskstask_idlogs--任务日志)
   - [4.5 GET /api/terminals — 终端列表](#45-get-apiterminals--终端列表)
   - [4.6 GET /api/dashboard/summary — 仪表板汇总](#46-get-apidashboardsummary--仪表板汇总)
-  - [4.7 POST /api/tasks/{task\_id}/review — 审阅任务](#47-post-apitaskstask_idreview--审阅任务)
-  - [4.8 POST /api/tasks/{task\_id}/resubmit-review — 重新提交审阅](#48-post-apitaskstask_idresubmit-review--重新提交审阅)
+  - [4.7 POST /api/tasks/{task\_id}/claim — 领取任务](#47-post-apitaskstask_idclaim--领取任务)
+  - [4.8 POST /api/tasks/{task\_id}/submit — 提交任务](#48-post-apitaskstask_idsubmit--提交任务)
+  - [4.9 POST /api/tasks/{task\_id}/verify — 验收任务](#49-post-apitaskstask_idverify--验收任务)
+  - [4.10 POST /api/tasks/{task\_id}/review — 审阅任务](#410-post-apitaskstask_idreview--审阅任务)
+  - [4.11 POST /api/tasks/{task\_id}/resubmit-review — 重新提交审阅](#411-post-apitaskstask_idresubmit-review--重新提交审阅)
 - [5. WebSocket 实时通信](#5-websocket-实时通信)
   - [5.1 WS /ws — WebSocket 端点](#51-ws-ws--websocket-端点)
   - [5.2 broadcast() 广播函数](#52-broadcast-广播函数)
@@ -58,7 +61,7 @@
 |------|------|
 | **看板视图** | 按任务状态（9 种）分列展示，模仿 Trello/Jira 风格 |
 | **REST API** | 提供任务列表、详情、日志、汇总、审阅等 JSON 接口 |
-| **WebSocket** | 支持实时任务变更通知（已定义，待集成） |
+| **WebSocket** | 实时任务变更通知，所有 POST 端点自动广播 |
 | **单文件全栈** | Python 后端 + 内嵌 HTML/CSS/JS，零额外前端依赖 |
 | **深色主题** | 采用 Slate 色系深色 UI，适合开发者长时间使用 |
 
@@ -338,7 +341,75 @@ FastAPI 应用生命周期管理器，确保：
 
 ---
 
-### 4.7 POST /api/tasks/{task\_id}/review — 审阅任务
+### 4.7 POST /api/tasks/{task\_id}/claim — 领取任务
+
+| 项 | 值 |
+|----|-----|
+| **路径** | `/api/tasks/{task_id}/claim` |
+| **方法** | `POST` |
+| **响应类型** | `JSON` |
+| **请求体** | 无 |
+
+**说明：** 将待处理任务标记为已领取，无需请求体。
+
+**成功响应**：返回更新后的任务 JSON  
+**失败响应**：`400 {"error": "错误描述"}` — 例如任务状态不允许领取
+
+内部调用 `TaskManager.claim_task(task_id)`。操作完成后自动通过 WebSocket 广播 `task_updated` 事件。
+
+---
+
+### 4.8 POST /api/tasks/{task\_id}/submit — 提交任务
+
+| 项 | 值 |
+|----|-----|
+| **路径** | `/api/tasks/{task_id}/submit` |
+| **方法** | `POST` |
+| **响应类型** | `JSON` |
+| **请求体** | 无 |
+
+**说明：** 将进行中的任务提交完成，无需请求体。
+
+**成功响应**：返回更新后的任务 JSON  
+**失败响应**：`400 {"error": "错误描述"}` — 例如任务状态不允许提交
+
+内部调用 `TaskManager.submit_task(task_id)`。操作完成后自动通过 WebSocket 广播 `task_updated` 事件。
+
+---
+
+### 4.9 POST /api/tasks/{task\_id}/verify — 验收任务
+
+| 项 | 值 |
+|----|-----|
+| **路径** | `/api/tasks/{task_id}/verify` |
+| **方法** | `POST` |
+| **响应类型** | `JSON` |
+| **请求体** | `application/json` |
+
+**请求体参数（使用 `Body()` 注解）：**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `approved` | `bool` | ✅ 是 | `true` = 验收通过，`false` = 验收不通过 |
+| `comment` | `str` | 否 | 验收意见，默认空字符串 |
+
+**请求示例：**
+
+```json
+{
+  "approved": true,
+  "comment": "功能验收通过"
+}
+```
+
+**成功响应**：返回更新后的任务 JSON  
+**失败响应**：`400 {"error": "错误描述"}` — 例如任务状态不允许验收
+
+内部调用 `TaskManager.verify_task(task_id, approved, comment)`。操作完成后自动通过 WebSocket 广播 `task_updated` 事件。
+
+---
+
+### 4.10 POST /api/tasks/{task\_id}/review — 审阅任务
 
 | 项 | 值 |
 |----|-----|
@@ -366,11 +437,11 @@ FastAPI 应用生命周期管理器，确保：
 **成功响应**：返回更新后的任务 JSON  
 **失败响应**：`400 {"error": "错误描述"}` — 例如任务状态不允许审阅
 
-内部调用 `TaskManager.review_task(task_id, approved, comment)`。
+内部调用 `TaskManager.review_task(task_id, approved, comment)`。操作完成后自动通过 WebSocket 广播 `task_updated` 事件。
 
 ---
 
-### 4.8 POST /api/tasks/{task\_id}/resubmit-review — 重新提交审阅
+### 4.11 POST /api/tasks/{task\_id}/resubmit-review — 重新提交审阅
 
 | 项 | 值 |
 |----|-----|
@@ -384,7 +455,7 @@ FastAPI 应用生命周期管理器，确保：
 **成功响应**：返回更新后的任务 JSON  
 **失败响应**：`400 {"error": "错误描述"}`
 
-内部调用 `TaskManager.resubmit_for_review(task_id)`。
+内部调用 `TaskManager.resubmit_for_review(task_id)`。操作完成后自动通过 WebSocket 广播 `task_updated` 事件。
 
 ---
 
@@ -450,9 +521,9 @@ async def broadcast(event: str, data: dict):
 
 ### 5.3 当前集成状态
 
-> ⚠️ **注意**：`broadcast()` 函数已定义且功能完备，但当前**未被任何 REST API 端点或 CLI 操作主动调用**。前端 WebSocket 客户端已实现接收逻辑，但实际推送需要在 `TaskManager` 操作（如 claim、submit、review 等）完成后手动调用 `broadcast()`。
+> ✅ **已集成**：所有 5 个 POST 端点（claim、submit、verify、review、resubmit-review）在操作成功后均调用 `await broadcast("task_updated", task.to_dict())`，实现真正的实时推送。
 
-当前前端的实时更新依赖于 **轮询**（`setInterval(refresh, 5000)`），WebSocket 连接仅作为预留通道。
+前端通过 `ws.onmessage` 监听广播事件并自动调用 `refresh()` 刷新看板。`setInterval(refresh, 5000)` 轮询作为 fallback 保留，确保即使 WebSocket 断开也能定期更新。
 
 ---
 
@@ -735,9 +806,9 @@ def api_review_task(
 - 各 API 端点通过 `_get_tm()` 获取实例
 - `_init_web()` 内部幂等检查，确保只初始化一次
 
-### 6. WebSocket 预留架构
+### 6. WebSocket 实时推送架构
 
-`broadcast()` 函数和 `/ws` 端点已完整实现，但当前未从 TaskManager 操作中调用。设计上为未来集成预留了通道——只需在任务状态变更后调用 `await broadcast("task_updated", {...})` 即可实现真正的实时推送。
+所有 POST 变更端点（claim/submit/verify/review/resubmit-review）在操作成功后自动调用 `await broadcast("task_updated", task.to_dict())`。前端通过 `ws.onmessage` 监听事件并触发看板刷新，实现毫秒级实时更新。轮询（5 秒间隔）作为 WebSocket 断线时的 fallback 保留。
 
 ---
 
@@ -745,14 +816,12 @@ def api_review_task(
 
 | 编号 | 限制 | 影响 | 可能的改进方向 |
 |------|------|------|---------------|
-| 1 | WebSocket `broadcast()` 未集成 | 实时推送不生效，依赖 5 秒轮询 | 在 TaskManager 操作后调用 broadcast |
-| 2 | `StaticFiles` 已导入但未使用 | 无功能影响，冗余导入 | 移除或用于后续静态资源服务 |
-| 3 | 日志加载逻辑效率低 | 需要 N+1 次请求（1 次列表 + N 次日志） | 增加聚合日志 API |
-| 4 | 无任务操作按钮 | 仅能查看，不能在 Web 上领取/提交 | 前端添加操作按钮调用 API |
-| 5 | `limit=9999` 硬编码 | summary 统计查询所有任务 | 添加专用统计 SQL 查询 |
-| 6 | 前端无路由 / SPA | 无法通过 URL 直接访问特定任务 | 添加前端路由或详情弹窗 |
-| 7 | 无认证/授权 | 任何人可访问 Dashboard | 添加 Basic Auth 或 Token |
-| 8 | `blocked` 和 `cancelled` 不在看板中 | 这两种状态的任务在看板上不可见 | 添加"归档"列或过滤视图 |
+| 1 | `StaticFiles` 已导入但未使用 | 无功能影响，冗余导入 | 移除或用于后续静态资源服务 |
+| 2 | 日志加载逻辑效率低 | 需要 N+1 次请求（1 次列表 + N 次日志） | 增加聚合日志 API |
+| 3 | `limit=9999` 硬编码 | summary 统计查询所有任务 | 添加专用统计 SQL 查询 |
+| 4 | 前端无路由 / SPA | 无法通过 URL 直接访问特定任务 | 添加前端路由或详情弹窗 |
+| 5 | 无认证/授权 | 任何人可访问 Dashboard | 添加 Basic Auth 或 Token |
+| 6 | `blocked` 和 `cancelled` 不在看板中 | 这两种状态的任务在看板上不可见 | 添加"归档"列或过滤视图 |
 
 ---
 
@@ -768,6 +837,9 @@ def api_review_task(
 | `GET` | `/api/tasks/{id}/logs` | 任务日志 | — |
 | `GET` | `/api/terminals` | 终端列表 | — |
 | `GET` | `/api/dashboard/summary` | 仪表板统计汇总 | — |
+| `POST` | `/api/tasks/{id}/claim` | 领取任务 | — |
+| `POST` | `/api/tasks/{id}/submit` | 提交任务 | — |
+| `POST` | `/api/tasks/{id}/verify` | 验收任务 | `{approved, comment}` |
 | `POST` | `/api/tasks/{id}/review` | 审阅通过/驳回 | `{approved, comment}` |
 | `POST` | `/api/tasks/{id}/resubmit-review` | 重新提交审阅 | — |
 | `WS` | `/ws` | WebSocket 实时通道 | — |
