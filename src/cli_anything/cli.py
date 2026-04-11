@@ -19,6 +19,7 @@ from cli_anything.core.terminal_manager import TerminalManager
 from cli_anything.core.test_runner import run_tests_simple
 from cli_anything.storage.database import Database
 from cli_anything.utils.config import Config
+from cli_anything.notification.notifier import Notifier
 
 app = typer.Typer(
     name="cli-anything",
@@ -48,7 +49,8 @@ def _init():
     _db = Database(db_path)
     _db.connect()
     _term_mgr = TerminalManager(_db, _config)
-    _tm = TaskManager(_db, terminal_id=_term_mgr.current.id)
+    notifier = Notifier(_config)
+    _tm = TaskManager(_db, terminal_id=_term_mgr.current.id, notifier=notifier)
 
 
 def _get_tm() -> TaskManager:
@@ -712,7 +714,26 @@ def health(
 
 # ── 入口 ────────────────────────────────────────────────────
 
+def _resolve_aliases():
+    """解析命令别名：将 sys.argv 中的别名替换为实际命令"""
+    if len(sys.argv) < 2:
+        return
+    try:
+        config = Config()
+        config.load()
+        aliases = config.get("aliases", {})
+        if not aliases:
+            return
+        cmd = sys.argv[1]
+        if cmd in aliases:
+            expanded = aliases[cmd].split()
+            sys.argv = [sys.argv[0]] + expanded + sys.argv[2:]
+    except Exception:
+        pass  # 别名解析失败不影响正常流程
+
+
 def main():
+    _resolve_aliases()
     app()
 
 

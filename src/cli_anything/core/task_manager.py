@@ -28,9 +28,23 @@ class TaskManagerError(Exception):
 class TaskManager:
     """任务管理核心，所有业务逻辑的入口"""
 
-    def __init__(self, db: Database, terminal_id: str = ""):
+    def __init__(self, db: Database, terminal_id: str = "", notifier=None):
         self.db = db
         self.terminal_id = terminal_id
+        self._notifier = notifier
+
+    def _notify_status_change(self, task: "Task", old_status: str, new_status: str):
+        """通知状态变更（如果 Notifier 已配置）"""
+        if self._notifier:
+            self._notifier.on_status_change(task.id, old_status, new_status, task.title)
+
+    def _notify_submit(self, task: "Task"):
+        if self._notifier:
+            self._notifier.on_submit(task.id, task.title, self.terminal_id)
+
+    def _notify_verify(self, task: "Task", approved: bool, comment: str):
+        if self._notifier:
+            self._notifier.on_verify(task.id, task.title, approved, comment)
 
     # ── 任务创建 ───────────────────────────────────────────
 
@@ -172,6 +186,7 @@ class TaskManager:
             old_value=old_status.value,
             new_value=new_status.value,
         )
+        self._notify_status_change(task, old_status.value, new_status.value)
         return task
 
     def start_task(self, task_id: str) -> Task:
@@ -193,6 +208,7 @@ class TaskManager:
         task.submitted_at = _now_iso()
         self.db.update_task(task)
         self._log(task_id, "submitted", detail="任务已提交待审核")
+        self._notify_submit(task)
         return task
 
     # ── 审核验收 ───────────────────────────────────────────
@@ -222,6 +238,7 @@ class TaskManager:
             self.db.update_task(task)
             self._log(task_id, "rejected", detail=f"验收驳回: {comment}")
 
+        self._notify_verify(task, approved, comment)
         return task
 
     # ── 审阅 ────────────────────────────────────────────────

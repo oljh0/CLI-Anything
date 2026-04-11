@@ -29,7 +29,7 @@ dev = [
 ]
 
 [project.scripts]
-cli-anything = "cli_anything.cli:app"
+cli-anything = "cli_anything.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

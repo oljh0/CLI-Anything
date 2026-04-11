@@ -146,10 +146,52 @@ def api_summary():
     }
 
 
+# ── 任务操作 API ─────────────────────────────────────────────
+
+@web_app.post("/api/tasks/{task_id}/claim")
+async def api_claim_task(task_id: str):
+    """领取任务"""
+    tm = _get_tm()
+    try:
+        task = tm.claim_task(task_id)
+        await broadcast("task_updated", task.to_dict())
+        return task.to_dict()
+    except TaskManagerError as e:
+        return JSONResponse({"error": str(e)}, 400)
+
+
+@web_app.post("/api/tasks/{task_id}/submit")
+async def api_submit_task(task_id: str):
+    """提交任务"""
+    tm = _get_tm()
+    try:
+        task = tm.submit_task(task_id)
+        await broadcast("task_updated", task.to_dict())
+        return task.to_dict()
+    except TaskManagerError as e:
+        return JSONResponse({"error": str(e)}, 400)
+
+
+@web_app.post("/api/tasks/{task_id}/verify")
+async def api_verify_task(
+    task_id: str,
+    approved: bool = Body(...),
+    comment: str = Body(""),
+):
+    """验收任务"""
+    tm = _get_tm()
+    try:
+        task = tm.verify_task(task_id, approved=approved, comment=comment)
+        await broadcast("task_updated", task.to_dict())
+        return task.to_dict()
+    except TaskManagerError as e:
+        return JSONResponse({"error": str(e)}, 400)
+
+
 # ── 审阅 API ────────────────────────────────────────────────
 
 @web_app.post("/api/tasks/{task_id}/review")
-def api_review_task(
+async def api_review_task(
     task_id: str,
     approved: bool = Body(...),
     comment: str = Body(""),
@@ -158,17 +200,19 @@ def api_review_task(
     tm = _get_tm()
     try:
         task = tm.review_task(task_id, approved=approved, comment=comment)
+        await broadcast("task_updated", task.to_dict())
         return task.to_dict()
     except TaskManagerError as e:
         return JSONResponse({"error": str(e)}, 400)
 
 
 @web_app.post("/api/tasks/{task_id}/resubmit-review")
-def api_resubmit_review(task_id: str):
+async def api_resubmit_review(task_id: str):
     """重新提交审阅"""
     tm = _get_tm()
     try:
         task = tm.resubmit_for_review(task_id)
+        await broadcast("task_updated", task.to_dict())
         return task.to_dict()
     except TaskManagerError as e:
         return JSONResponse({"error": str(e)}, 400)
