@@ -133,6 +133,11 @@ CREATE TABLE IF NOT EXISTS task_deps (
 
 CREATE INDEX IF NOT EXISTS idx_task_deps_task ON task_deps(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_deps_on ON task_deps(depends_on);
+
+-- 复合索引：加速 suggest_tasks / list_tasks 常见过滤组合
+CREATE INDEX IF NOT EXISTS idx_tasks_status_priority ON tasks(status, priority);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent_type ON tasks(parent_id, task_type);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent_status ON tasks(parent_id, status);
 """
 
 
@@ -167,6 +172,7 @@ class Database:
         conn.execute("PRAGMA wal_autocheckpoint=1000")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=-64000")
+        conn.execute("PRAGMA temp_store=MEMORY")  # 排序/JOIN 临时表放内存，减少 I/O
 
         # 首次连接时初始化表结构（全局只做一次）
         with self._lock:
@@ -441,6 +447,24 @@ class Database:
             )
             self.conn.commit()
         return cur.rowcount > 0
+
+    def get_tasks_by_ids(self, ids: list[str]) -> dict[str, "Task"]:
+        """批量获取任务，返回 {id: Task} 字典（避免 N+1 查询）"""
+        if not ids:
+            return {}
+        placeholders = ",".join("?" * len(ids))
+        cur = self.conn.execute(
+            f"SELECT * FROM tasks WHERE id IN ({placeholders})", ids
+        )
+        return {row["id"]: Task.from_row(dict(row)) for row in cur.fetchall()}
+
+    def get_all_dep_edges(self) -> dict[str, list[str]]:
+        """获取所有 task_deps 边（{task_id: [depends_on, ...]}），供 BFS 批量使用"""
+        cur = self.conn.execute("SELECT task_id, depends_on FROM task_deps")
+        result: dict[str, list[str]] = {}
+        for row in cur.fetchall():
+            result.setdefault(row["task_id"], []).append(row["depends_on"])
+        return result
 
     def list_dependencies(self, task_id: str) -> list[str]:
         """获取 task_id 依赖的所有任务 ID 列表"""

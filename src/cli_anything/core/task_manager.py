@@ -519,24 +519,30 @@ class TaskManager:
         dependent_ids = self.db.list_dependents(task_id)
         blocking_ids = self.db.list_blocking_deps(task_id)
 
-        dep_tasks = [self.db.get_task(tid) for tid in dep_ids]
-        dependent_tasks = [self.db.get_task(tid) for tid in dependent_ids]
+        # 批量查询，避免 N+1
+        all_ids = list(set(dep_ids + dependent_ids))
+        tasks_map = self.db.get_tasks_by_ids(all_ids)
 
-        def _task_summary(t):
+        def _task_summary(tid):
+            t = tasks_map.get(tid)
             if t is None:
                 return None
             return {"id": t.id, "title": t.title, "status": t.status.value}
 
         return {
             "task_id": task_id,
-            "depends_on": [_task_summary(t) for t in dep_tasks if t],
-            "depended_by": [_task_summary(t) for t in dependent_tasks if t],
+            "depends_on": [s for tid in dep_ids if (s := _task_summary(tid))],
+            "depended_by": [s for tid in dependent_ids if (s := _task_summary(tid))],
             "blocking": blocking_ids,
             "is_blocked": len(blocking_ids) > 0,
         }
 
     def _has_path(self, from_id: str, to_id: str) -> bool:
-        """BFS 检测从 from_id 出发是否能到达 to_id（用于循环检测）"""
+        """BFS 检测从 from_id 出发是否能到达 to_id（循环检测）
+
+        一次性加载所有依赖边到内存，避免 BFS 每层多次 DB 查询。
+        """
+        edges = self.db.get_all_dep_edges()  # {task_id: [depends_on, ...]}
         visited: set[str] = set()
         queue = [from_id]
         while queue:
@@ -544,7 +550,7 @@ class TaskManager:
             if current in visited:
                 continue
             visited.add(current)
-            for dep in self.db.list_dependencies(current):
+            for dep in edges.get(current, []):
                 if dep == to_id:
                     return True
                 queue.append(dep)
