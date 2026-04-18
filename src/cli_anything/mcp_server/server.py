@@ -670,6 +670,53 @@ def task_get_deps(task_id: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+# ── 工具 25~26：Supervisor 自动路由 ──────────────────────────────────
+
+
+@mcp.tool()
+def task_route(task_id: str) -> dict:
+    """【工具 25】为任务推荐候选终端（Supervisor 视角）
+
+    根据任务 tags 与终端 capabilities 的交集，返回最适合处理该任务的 Worker 终端列表。
+    若任务无 tags 则返回所有活跃 Worker 终端。
+
+    Args:
+        task_id: 任务 ID
+
+    Returns:
+        candidates：候选终端列表，每项含 terminal_id、name、role、matched_tags、capabilities
+    """
+    tm = _get_tm()
+    try:
+        candidates = tm.route_task(task_id)
+        return {"ok": True, "candidates": candidates}
+    except TaskManagerError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+def task_suggest(terminal_id: str | None = None, limit: int = 10) -> dict:
+    """【工具 26】为终端推荐候选任务（Worker 视角）
+
+    根据终端 capabilities 与任务 tags 的交集过滤 pending 任务，按优先级排序。
+    capabilities 为空时返回全量 pending 任务。无交集时 fallback 到全量。
+
+    Args:
+        terminal_id: 终端 ID，默认使用当前 mcp-agent 终端
+        limit: 最多返回条数，默认 10
+
+    Returns:
+        tasks：推荐任务列表（Task 字典）
+    """
+    tm = _get_tm()
+    tid = terminal_id or _get_agent_terminal_id()
+    try:
+        tasks = tm.suggest_tasks(tid, limit=limit)
+        return {"ok": True, "tasks": [t.to_dict() for t in tasks]}
+    except TaskManagerError as e:
+        return {"ok": False, "error": str(e)}
+
+
 # ── 启动入口 ────────────────────────────────────────────────
 
 def serve():

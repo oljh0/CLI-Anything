@@ -14,7 +14,7 @@
   - [2.1 全局变量](#21-全局变量)
   - [2.2 初始化函数 \_init\_mcp()](#22-初始化函数-_init_mcp)
   - [2.3 辅助访问函数](#23-辅助访问函数)
-- [3. 工具详解（全部 24 个工具）](#3-工具详解全部-24-个工具)
+- [3. 工具详解（全部 26 个工具）](#3-工具详解全部-26-个工具)
   - [3.1 任务创建](#31-任务创建)
   - [3.2 查询](#32-查询)
   - [3.3 任务流转](#33-任务流转)
@@ -41,7 +41,7 @@
 
 ## 1. 模块概述
 
-`server.py` 是 CLI-Anything 项目的 **AI Agent 访问层**，基于 FastMCP 框架实现 Model Context Protocol (MCP) 服务器。它为 AI Agent（如 Claude、GPT、Gemini 等）提供 **24 个标准化工具**，使 Agent 能够通过 MCP 协议直接操作任务系统。
+`server.py` 是 CLI-Anything 项目的 **AI Agent 访问层**，基于 FastMCP 框架实现 Model Context Protocol (MCP) 服务器。它为 AI Agent（如 Claude、GPT、Gemini 等）提供 **26 个标准化工具**，使 Agent 能够通过 MCP 协议直接操作任务系统。
 
 核心职责：
 
@@ -1014,6 +1014,55 @@ Worker 在认领并完成审查后，通过此工具提交裁决结果。
 
 ---
 
+#### 25. `task_route` — 为任务推荐候选终端
+
+Supervisor 视角：根据任务 tags 与终端 capabilities 的交集，返回最适合处理该任务的 Worker 终端列表。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `task_id` | `str` | ✅ | 任务 ID |
+
+**返回格式**：
+
+```json
+{
+  "ok": true,
+  "candidates": [
+    {"terminal_id": "w1", "name": "Worker1", "role": "worker", "matched_tags": ["python"], "capabilities": ["python", "backend"]}
+  ]
+}
+```
+
+> 任务无 tags 时返回所有活跃 Worker 终端（matched_tags 为空列表）。
+
+---
+
+#### 26. `task_suggest` — 为终端推荐候选任务
+
+Worker 视角：根据终端 capabilities 与任务 tags 的交集过滤 pending 任务，按优先级排序。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `terminal_id` | `str` | ❌ | 当前 mcp-agent | 终端 ID |
+| `limit` | `int` | ❌ | `10` | 最多返回条数 |
+
+**返回格式**：
+
+```json
+{
+  "ok": true,
+  "tasks": [{"id": "...", "title": "...", "priority": 1, "tags": ["python"], ...}]
+}
+```
+
+> capabilities 为空时返回全量 pending；有 capabilities 但无匹配 tag 时也 fallback 全量。
+
+---
+
 ## 4. 返回格式规范
 
 所有工具遵循统一的返回格式约定：
@@ -1257,6 +1306,8 @@ def serve():
 | 22 | `task_add_dep` | 添加前置依赖 | `task_id`*, `depends_on`* | ✅ |
 | 23 | `task_remove_dep` | 移除前置依赖 | `task_id`*, `depends_on`* | ✅ |
 | 24 | `task_get_deps` | 查询依赖关系 | `task_id`* | ✅ |
+| 25 | `task_route` | 为任务推荐终端 | `task_id`* | ✅ |
+| 26 | `task_suggest` | 为终端推荐任务 | `terminal_id`, `limit` | ✅ |
 
 > `*` 表示必填参数；⭐ 表示含特殊逻辑
 

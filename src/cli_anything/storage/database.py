@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS terminals (
     role          TEXT NOT NULL DEFAULT 'worker',
     type          TEXT DEFAULT '',
     pid           INTEGER DEFAULT 0,
+    capabilities  TEXT NOT NULL DEFAULT '[]',
     last_active   TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     registered_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
@@ -208,6 +209,10 @@ class Database:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_task_deps_task ON task_deps(task_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_task_deps_on ON task_deps(depends_on)")
+        # 为已有数据库添加 capabilities 列
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(terminals)").fetchall()}
+        if "capabilities" not in existing:
+            conn.execute("ALTER TABLE terminals ADD COLUMN capabilities TEXT NOT NULL DEFAULT '[]'")
         conn.commit()
 
     def close(self):

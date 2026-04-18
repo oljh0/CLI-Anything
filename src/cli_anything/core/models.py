@@ -192,6 +192,7 @@ class Terminal:
     role: TerminalRole = TerminalRole.WORKER
     type: str = ""  # powershell / cmd / wsl / ssh
     pid: int = 0
+    capabilities: list[str] = field(default_factory=list)  # 技能/标签列表，用于路由匹配
     last_active: str = field(default_factory=_now_iso)
     registered_at: str = field(default_factory=_now_iso)
 
@@ -199,6 +200,7 @@ class Terminal:
         """转换为字典"""
         d = asdict(self)
         d["role"] = self.role.value
+        d["capabilities"] = json.dumps(self.capabilities, ensure_ascii=False)
         return d
 
     @classmethod
@@ -210,6 +212,7 @@ class Terminal:
             role=TerminalRole(row.get("role", "worker")),
             type=row.get("type", ""),
             pid=row.get("pid", 0),
+            capabilities=json.loads(row.get("capabilities", "[]")),
             last_active=row.get("last_active", ""),
             registered_at=row.get("registered_at", ""),
         )

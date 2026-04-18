@@ -550,6 +550,101 @@ class TaskManager:
                 queue.append(dep)
         return False
 
+    # ── Supervisor 自动路由 ──────────────────────────────────
+
+    def update_capabilities(self, terminal_id: str, capabilities: list[str]) -> None:
+        """更新终端的技能列表
+
+        技能列表用于任务路由匹配。Worker 注册后调用此方法声明自己能处理哪类标签的任务。
+
+        Args:
+            terminal_id: 终端 ID
+            capabilities: 技能/标签列表，与任务 tags 做匹配
+        """
+        terminal = self.db.get_terminal(terminal_id)
+        if terminal is None:
+            raise TaskManagerError(f"终端 {terminal_id} 不存在，请先注册")
+        terminal.capabilities = capabilities
+        self.db.upsert_terminal(terminal)
+
+    def route_task(self, task_id: str) -> list[dict]:
+        """为指定任务推荐候选终端（Supervisor 视角）
+
+        根据任务 tags 与终端 capabilities 的交集匹配，返回候选 Worker 终端。
+
+        匹配规则：
+        - 任务有 tags → 返回 capabilities 包含任意匹配 tag 的 Worker 终端
+        - 任务无 tags → 返回所有活跃 Worker 终端
+
+        Args:
+            task_id: 任务 ID
+
+        Returns:
+            list of dict，每项包含：
+            - terminal_id, name, role, matched_tags（交集），capabilities
+        """
+        task = self._get_or_raise(task_id)
+        terminals = self.db.list_terminals()
+        workers = [t for t in terminals if t.role.value == "worker"]
+
+        task_tags = set(task.tags)
+        result = []
+
+        if not task_tags:
+            for t in workers:
+                result.append({
+                    "terminal_id": t.id,
+                    "name": t.name,
+                    "role": t.role.value,
+                    "matched_tags": [],
+                    "capabilities": t.capabilities,
+                })
+        else:
+            for t in workers:
+                matched = list(task_tags & set(t.capabilities))
+                if matched:
+                    result.append({
+                        "terminal_id": t.id,
+                        "name": t.name,
+                        "role": t.role.value,
+                        "matched_tags": matched,
+                        "capabilities": t.capabilities,
+                    })
+
+        return result
+
+    def suggest_tasks(self, terminal_id: str, limit: int = 10) -> list[Task]:
+        """为指定终端推荐候选任务（Worker 视角）
+
+        根据终端 capabilities 与任务 tags 的交集过滤，按优先级从高到低排序。
+
+        匹配规则：
+        - capabilities 不为空 → 先过滤有匹配 tag 的任务，若无匹配则 fallback 全量
+        - capabilities 为空 → 直接返回所有 pending 任务
+
+        Args:
+            terminal_id: 终端 ID
+            limit: 最多返回多少条（默认 10）
+
+        Returns:
+            按优先级排序的 pending 任务列表
+        """
+        terminal = self.db.get_terminal(terminal_id)
+        if terminal is None:
+            raise TaskManagerError(f"终端 {terminal_id} 不存在，请先注册")
+
+        all_pending = self.db.list_tasks(status=TaskStatus.PENDING.value)
+        all_pending.sort(key=lambda t: t.priority)
+
+        if not terminal.capabilities:
+            return all_pending[:limit]
+
+        caps = set(terminal.capabilities)
+        matched = [t for t in all_pending if set(t.tags) & caps]
+        if matched:
+            return matched[:limit]
+        return all_pending[:limit]
+
     # ── Judgment Day 双盲对抗审查 ────────────────────────────────
 
     def trigger_judgment_day(self, task_id: str) -> tuple[Task, Task]:
