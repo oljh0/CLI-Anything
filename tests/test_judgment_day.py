@@ -273,3 +273,35 @@ class TestSynthesizeJudgment:
         assert result["judge_a"]["verdict"] == "clean"
         assert result["judge_b"]["verdict"] == "clean"
         assert result["round"] == 1
+
+    def test_round_tag_missing_raises(self, tm, submitted_task):
+        """审查任务缺少 jd-round-N 标签时应报错（round=0 分支）"""
+        # 直接插入一个没有 jd-round-N 标签的 REVIEW 任务
+        from cli_anything.core.models import Task, TaskStatus, TaskType
+        from cli_anything.core.models import _new_id, _now_iso
+        broken = tm.db.insert_task(Task(
+            id=_new_id(),
+            title="broken review",
+            description="",
+            task_type=TaskType.REVIEW,
+            parent_id=submitted_task.id,
+            status=TaskStatus.SUBMITTED,
+            tags=["jd-judge-a"],  # 故意缺少 jd-round-N
+            test_report={"verdict": "clean", "findings": [], "summary": ""},
+            created_at=_now_iso(),
+            updated_at=_now_iso(),
+        ))
+        broken2 = tm.db.insert_task(Task(
+            id=_new_id(),
+            title="broken review b",
+            description="",
+            task_type=TaskType.REVIEW,
+            parent_id=submitted_task.id,
+            status=TaskStatus.SUBMITTED,
+            tags=["jd-judge-b"],  # 同样缺少 jd-round-N
+            test_report={"verdict": "clean", "findings": [], "summary": ""},
+            created_at=_now_iso(),
+            updated_at=_now_iso(),
+        ))
+        with pytest.raises(TaskManagerError, match="jd-round-N"):
+            tm.synthesize_judgment(submitted_task.id)

@@ -334,3 +334,88 @@ class TestSubmitEnvelope:
         """空值不写入 test_report"""
         result = tm.submit_task(in_progress_task.id, summary="", changed_files=None, test_note="")
         assert (result.test_report or {}).get("submit_summary") is None
+
+
+# ── 覆盖率补充测试 ──────────────────────────────────────────────────
+
+
+class TestCreateTaskEdgeCases:
+    def test_nonexistent_parent_id_raises(self, tm):
+        with pytest.raises(TaskManagerError, match="不存在"):
+            tm.create_task("子任务", parent_id="nonexistent-parent")
+
+
+class TestUpdateTaskBranches:
+    def test_update_description(self, tm):
+        task = tm.create_task("任务")
+        updated = tm.update_task(task.id, description="新描述")
+        assert updated.description == "新描述"
+
+    def test_update_tags(self, tm):
+        task = tm.create_task("任务")
+        updated = tm.update_task(task.id, tags=["python", "backend"])
+        assert "python" in updated.tags
+
+    def test_update_test_path(self, tm):
+        task = tm.create_task("任务")
+        updated = tm.update_task(task.id, test_path="tests/test_foo.py")
+        assert updated.test_path == "tests/test_foo.py"
+
+    def test_update_work_dir(self, tm):
+        task = tm.create_task("任务")
+        updated = tm.update_task(task.id, work_dir="/app/src")
+        assert updated.work_dir == "/app/src"
+
+
+class TestDeleteTaskEdgeCases:
+    def test_delete_nonexistent_returns_false(self, tm):
+        assert tm.delete_task("nonexistent-task-id") is False
+
+
+class TestStatusErrors:
+    def test_unclaim_non_claimed_raises(self, tm):
+        task = tm.create_task("任务")
+        with pytest.raises(TaskManagerError, match="claimed"):
+            tm.unclaim_task(task.id)
+
+    def test_start_task_wrong_status_raises(self, tm):
+        task = tm.create_task("任务")  # pending
+        with pytest.raises(TaskManagerError, match="claimed"):
+            tm.start_task(task.id)
+
+    def test_submit_task_wrong_status_raises(self, tm):
+        task = tm.create_task("任务")
+        tm.claim_task(task.id)
+        with pytest.raises(TaskManagerError, match="in_progress"):
+            tm.submit_task(task.id)
+
+    def test_verify_task_wrong_status_raises(self, tm):
+        task = tm.create_task("任务")
+        tm.claim_task(task.id)
+        tm.start_task(task.id)
+        with pytest.raises(TaskManagerError, match="submitted"):
+            tm.verify_task(task.id, approved=True)
+
+
+class TestDatabaseFilters:
+    def test_list_tasks_by_claimed_by(self, tm, db):
+        tm.create_task("任务1")
+        t2 = tm.create_task("任务2")
+        tm.claim_task(t2.id)
+        results = db.list_tasks(claimed_by="test-terminal")
+        assert len(results) == 1
+        assert results[0].id == t2.id
+
+    def test_list_tasks_by_tag(self, tm, db):
+        tm.create_task("Python任务", tags=["python"])
+        tm.create_task("Java任务", tags=["java"])
+        results = db.list_tasks(tag="python")
+        assert len(results) == 1
+        assert "python" in results[0].tags
+
+    def test_list_logs_by_action(self, tm, db):
+        task = tm.create_task("日志任务")
+        tm.claim_task(task.id)
+        logs = db.list_logs(action="claimed")
+        assert len(logs) >= 1
+        assert all(log.action == "claimed" for log in logs)
