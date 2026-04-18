@@ -231,6 +231,7 @@ class TaskManager:
         summary: str = "",
         changed_files: Optional[list[str]] = None,
         test_note: str = "",
+        risks: str = "",
     ) -> Task:
         """提交任务（in_progress → submitted），可附带结构化交付信封
 
@@ -239,6 +240,8 @@ class TaskManager:
             summary: 本次实现内容的一句话摘要（可选）
             changed_files: 本次修改的文件列表（可选），如 ["src/auth.py", "tests/test_auth.py"]
             test_note: 测试通过情况的简要说明（可选），如 "全部 10 个测试通过"
+            risks: 发现的风险或副作用（可选），如 "修改了 API 签名，需更新调用方"；
+                   无风险时填 "None" 或留空。参考 ATL Envelope 规范。
 
         如果提供了信封字段，将合并写入 test_report，不会覆盖 TestRunner 已有的测试数据。
         """
@@ -254,6 +257,8 @@ class TaskManager:
             envelope["submit_changed_files"] = changed_files
         if test_note:
             envelope["submit_test_note"] = test_note
+        if risks:
+            envelope["submit_risks"] = risks
         if envelope:
             task.test_report = {**(task.test_report or {}), **envelope}
 
@@ -653,7 +658,11 @@ class TaskManager:
 
     # ── Judgment Day 双盲对抗审查 ────────────────────────────────
 
-    def trigger_judgment_day(self, task_id: str) -> tuple[Task, Task]:
+    def trigger_judgment_day(
+        self,
+        task_id: str,
+        project_standards: str = "",
+    ) -> tuple[Task, Task]:
         """为 submitted 状态的任务启动双盲对抗审查
 
         创建 Judge A 和 Judge B 两个独立审查任务（REVIEW 类型），
@@ -661,6 +670,9 @@ class TaskManager:
 
         Args:
             task_id: 待审查的任务 ID（必须处于 submitted 状态）
+            project_standards: 可选的项目规范摘要（代码风格/约定/禁忌），
+                               会注入到两个 judge 任务描述中，帮助 AI judge
+                               按项目标准审查，而非泛化最佳实践。
 
         Returns:
             (judge_a_task, judge_b_task)
@@ -698,6 +710,15 @@ class TaskManager:
             task.tags.append(round_tag)
         self.db.update_task(task)
 
+        # 构建可选的项目规范注入块
+        standards_block = ""
+        if project_standards.strip():
+            standards_block = (
+                f"\n\n## 项目规范（审查必须遵循）\n\n"
+                f"{project_standards.strip()}\n\n"
+                f"*以上规范高于通用最佳实践，审查结论必须以此为准。*"
+            )
+
         # 创建 Judge A 审查任务
         judge_a = self.create_task(
             title=f"【Judgment Day R{current_round}】Judge A 审查 #{task_id}",
@@ -705,7 +726,8 @@ class TaskManager:
                 f"## 双盲对抗审查 — Judge A（第 {current_round} 轮）\n\n"
                 f"**待审查任务**: #{task_id} — {task.title}\n\n"
                 f"**重要规则**：独立审查，不得查看 Judge B 的结论，不得与其他审查者沟通。\n\n"
-                f"**审查维度**：正确性 / 边界情况 / 错误处理 / 性能 / 安全性 / 命名与约定\n\n"
+                f"**审查维度**：正确性 / 边界情况 / 错误处理 / 性能 / 安全性 / 命名与约定"
+                f"{standards_block}\n\n"
                 f"审查完成后调用 `task_submit_verdict` 提交裁决，"
                 f"verdict 为 'clean'（无问题）或 'issues'（有问题）。"
             ),
@@ -721,7 +743,8 @@ class TaskManager:
                 f"## 双盲对抗审查 — Judge B（第 {current_round} 轮）\n\n"
                 f"**待审查任务**: #{task_id} — {task.title}\n\n"
                 f"**重要规则**：独立审查，不得查看 Judge A 的结论，不得与其他审查者沟通。\n\n"
-                f"**审查维度**：正确性 / 边界情况 / 错误处理 / 性能 / 安全性 / 命名与约定\n\n"
+                f"**审查维度**：正确性 / 边界情况 / 错误处理 / 性能 / 安全性 / 命名与约定"
+                f"{standards_block}\n\n"
                 f"审查完成后调用 `task_submit_verdict` 提交裁决，"
                 f"verdict 为 'clean'（无问题）或 'issues'（有问题）。"
             ),

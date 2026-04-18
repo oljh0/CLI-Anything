@@ -305,3 +305,66 @@ class TestSynthesizeJudgment:
         ))
         with pytest.raises(TaskManagerError, match="jd-round-N"):
             tm.synthesize_judgment(submitted_task.id)
+
+
+class TestProjectStandardsInjection:
+    """project_standards 注入到 judge 任务描述的测试"""
+
+    def test_standards_appear_in_judge_descriptions(self, tm, submitted_task):
+        """提供 project_standards 时，两个 judge 任务的描述都应包含该内容"""
+        standards = "使用 Python 3.10+ 类型注解，禁止直接操作 DB 绕过 TaskManager"
+        judge_a, judge_b = tm.trigger_judgment_day(submitted_task.id, project_standards=standards)
+
+        assert standards in judge_a.description
+        assert standards in judge_b.description
+        assert "项目规范" in judge_a.description
+        assert "项目规范" in judge_b.description
+
+    def test_no_standards_no_block(self, tm, submitted_task):
+        """不传 project_standards 时，judge 描述中不应出现"项目规范"块"""
+        judge_a, judge_b = tm.trigger_judgment_day(submitted_task.id)
+
+        assert "项目规范" not in judge_a.description
+        assert "项目规范" not in judge_b.description
+
+    def test_empty_string_standards_ignored(self, tm, submitted_task):
+        """传入空字符串时等同于不传，不插入规范块"""
+        judge_a, judge_b = tm.trigger_judgment_day(submitted_task.id, project_standards="   ")
+
+        assert "项目规范" not in judge_a.description
+        assert "项目规范" not in judge_b.description
+
+
+class TestSubmitEnvelopeRisks:
+    """submit_task risks 字段测试"""
+
+    def _make_inprogress(self, tm):
+        task = tm.create_task(title="测试任务")
+        tm.claim_task(task.id)
+        tm.start_task(task.id)
+        return tm.get_task(task.id)
+
+    def test_risks_stored_in_test_report(self, tm):
+        """risks 字段应存入 test_report.submit_risks"""
+        task = self._make_inprogress(tm)
+        result = tm.submit_task(task.id, risks="修改了 API 签名，需更新调用方")
+        assert result.test_report.get("submit_risks") == "修改了 API 签名，需更新调用方"
+
+    def test_empty_risks_not_stored(self, tm):
+        """未传 risks 时，test_report 中不应有 submit_risks 键"""
+        task = self._make_inprogress(tm)
+        result = tm.submit_task(task.id)
+        assert "submit_risks" not in result.test_report
+
+    def test_risks_combined_with_other_envelope_fields(self, tm):
+        """risks 与 summary / changed_files 可以同时存入"""
+        task = self._make_inprogress(tm)
+        result = tm.submit_task(
+            task.id,
+            summary="完成实现",
+            changed_files=["src/a.py"],
+            risks="无明显风险",
+        )
+        assert result.test_report["submit_summary"] == "完成实现"
+        assert result.test_report["submit_changed_files"] == ["src/a.py"]
+        assert result.test_report["submit_risks"] == "无明显风险"

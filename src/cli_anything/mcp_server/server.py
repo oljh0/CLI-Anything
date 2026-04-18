@@ -235,14 +235,16 @@ def task_submit(
     summary: str = "",
     changed_files: list = None,
     test_note: str = "",
+    risks: str = "",
 ) -> dict:
-    """提交已完成的任务，可附带结构化交付信封
+    """提交已完成的任务，可附带结构化交付信封（ATL Envelope 规范）
 
     Args:
         task_id: 任务 ID
         summary: 实现内容摘要（推荐填写），如"实现了用户登录接口，支持 OAuth2"
         changed_files: 本次修改的文件列表，如 ["src/auth.py", "tests/test_auth.py"]
         test_note: 测试通过情况说明，如"全部 12 个测试通过，覆盖率 87%"
+        risks: 发现的风险或副作用，如"修改了 API 签名，需更新调用方"；无风险填 "None"
     """
     tm = _get_tm()
     try:
@@ -252,7 +254,7 @@ def task_submit(
         # 如果还在 claimed，自动过渡到 in_progress
         if task.status == TaskStatus.CLAIMED:
             tm.start_task(task_id)
-        task = tm.submit_task(task_id, summary=summary, changed_files=changed_files, test_note=test_note)
+        task = tm.submit_task(task_id, summary=summary, changed_files=changed_files, test_note=test_note, risks=risks)
         result: dict = {"success": True, "task_id": task_id, "status": "submitted"}
         if task.test_report:
             envelope = {k: v for k, v in task.test_report.items() if k.startswith("submit_")}
@@ -509,7 +511,7 @@ def task_health(
 
 
 @mcp.tool()
-def task_judgment_day(task_id: str) -> dict:
+def task_judgment_day(task_id: str, project_standards: str = "") -> dict:
     """为 submitted 状态的任务启动双盲对抗审查（Judgment Day）
 
     创建两个独立的 REVIEW 任务（Judge A 和 Judge B），
@@ -517,16 +519,22 @@ def task_judgment_day(task_id: str) -> dict:
 
     Args:
         task_id: 待审查的任务 ID（必须处于 submitted 状态）
+        project_standards: 可选的项目规范摘要（代码风格/约定/禁忌），
+                           会注入到两个 judge 任务描述中，让 AI judge 按
+                           项目标准审查，而非泛化最佳实践。
+                           示例: "使用 Python 3.10+类型注解，函数注释用中文，
+                                  禁止直接操作 DB 绕过 TaskManager"
     """
     tm = _get_tm()
     try:
-        judge_a, judge_b = tm.trigger_judgment_day(task_id)
+        judge_a, judge_b = tm.trigger_judgment_day(task_id, project_standards=project_standards)
         return {
             "success": True,
             "task_id": task_id,
             "judge_a": {"id": judge_a.id, "title": judge_a.title, "status": judge_a.status.value},
             "judge_b": {"id": judge_b.id, "title": judge_b.title, "status": judge_b.status.value},
             "message": "双盲审查已启动，请由两个不同的 Worker 分别认领 judge_a 和 judge_b 任务",
+            "standards_injected": bool(project_standards.strip()),
         }
     except TaskManagerError as e:
         return {"success": False, "error": str(e)}
