@@ -14,7 +14,7 @@
   - [2.1 全局变量](#21-全局变量)
   - [2.2 初始化函数 \_init\_mcp()](#22-初始化函数-_init_mcp)
   - [2.3 辅助访问函数](#23-辅助访问函数)
-- [3. 工具详解（全部 17 个工具）](#3-工具详解全部-17-个工具)
+- [3. 工具详解（全部 24 个工具）](#3-工具详解全部-24-个工具)
   - [3.1 任务创建](#31-任务创建)
   - [3.2 查询](#32-查询)
   - [3.3 任务流转](#33-任务流转)
@@ -22,6 +22,8 @@
   - [3.5 更新与删除](#35-更新与删除)
   - [3.6 日志](#36-日志)
   - [3.7 测试与健康](#37-测试与健康)
+  - [3.8 Judgment Day](#38-judgment-day)
+  - [3.9 任务依赖图（DAG）](#39-任务依赖图dag)
 - [4. 返回格式规范](#4-返回格式规范)
 - [5. task\_submit 特殊逻辑](#5-task_submit-特殊逻辑)
 - [6. 状态枚举参考](#6-状态枚举参考)
@@ -39,7 +41,7 @@
 
 ## 1. 模块概述
 
-`server.py` 是 CLI-Anything 项目的 **AI Agent 访问层**，基于 FastMCP 框架实现 Model Context Protocol (MCP) 服务器。它为 AI Agent（如 Claude、GPT、Gemini 等）提供 **17 个标准化工具**，使 Agent 能够通过 MCP 协议直接操作任务系统。
+`server.py` 是 CLI-Anything 项目的 **AI Agent 访问层**，基于 FastMCP 框架实现 Model Context Protocol (MCP) 服务器。它为 AI Agent（如 Claude、GPT、Gemini 等）提供 **24 个标准化工具**，使 Agent 能够通过 MCP 协议直接操作任务系统。
 
 核心职责：
 
@@ -135,7 +137,7 @@ def _init_mcp():
 
 ---
 
-## 3. 工具详解（全部 17 个工具）
+## 3. 工具详解（全部 21 个工具）
 
 ### 3.1 任务创建
 
@@ -769,6 +771,249 @@ task_update(task_id="task-001", priority=1, tags=["urgent", "auth"])
 
 ---
 
+#### 18. `task_judgment_day` — 触发双盲对抗审查
+
+为 `submitted` 状态的任务创建两个独立审查任务（Judge A 和 Judge B），启动 Judgment Day 流程。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `task_id` | `str` | ✅ | 被审查的任务 ID（必须是 submitted 状态） |
+
+**返回格式**：
+
+```json
+{
+  "success": true,
+  "task_id": "task-001",
+  "judge_a": {"id": "review-001", "title": "【Judgment Day R1】Judge A 审查 #task-001", "status": "pending"},
+  "judge_b": {"id": "review-002", "title": "【Judgment Day R1】Judge B 审查 #task-001", "status": "pending"},
+  "message": "双盲审查已启动，请由两个不同的 Worker 分别认领 judge_a 和 judge_b 任务"
+}
+```
+
+**错误场景**：
+
+```json
+{"success": false, "error": "只能对 submitted 状态的任务发起 Judgment Day，当前状态: in_progress"}
+{"success": false, "error": "已达到最大审查轮次（2 轮），建议人工介入处理或直接验收"}
+```
+
+---
+
+#### 19. `task_submit_verdict` — 提交审查裁决
+
+Worker 在认领并完成审查后，通过此工具提交裁决结果。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `review_task_id` | `str` | ✅ | — | 审查任务 ID（task_type = review） |
+| `verdict` | `str` | ✅ | — | `"clean"`（无问题）或 `"issues"`（有问题） |
+| `findings` | `list` | ❌ | `[]` | 发现的问题列表 |
+| `summary` | `str` | ❌ | `""` | 一句话审查总结 |
+
+`findings` 列表中每项格式：
+
+```json
+{
+  "desc": "问题描述",
+  "severity": "CRITICAL",   // CRITICAL / WARNING / SUGGESTION
+  "location": "文件:行号"   // 可选
+}
+```
+
+**返回格式**：
+
+```json
+{
+  "success": true,
+  "review_task_id": "review-001",
+  "verdict": "issues",
+  "findings_count": 2,
+  "status": "submitted"
+}
+```
+
+---
+
+#### 20. `task_get_reviews` — 获取所有审查任务
+
+获取某任务下的所有 REVIEW 类型任务，包含各轮次的 Judge A 和 Judge B。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `task_id` | `str` | ✅ | 被审查的原始任务 ID |
+
+**返回格式**：
+
+```json
+{
+  "success": true,
+  "task_id": "task-001",
+  "count": 2,
+  "reviews": [
+    {
+      "id": "review-001",
+      "title": "【Judgment Day R1】Judge A 审查 #task-001",
+      "status": "submitted",
+      "tags": ["jd-judge-a", "jd-round-1"],
+      "verdict": "issues"
+    },
+    {
+      "id": "review-002",
+      "title": "【Judgment Day R1】Judge B 审查 #task-001",
+      "status": "submitted",
+      "tags": ["jd-judge-b", "jd-round-1"],
+      "verdict": "clean"
+    }
+  ]
+}
+```
+
+---
+
+#### 21. `task_synthesize` — 综合审查裁决
+
+综合最新一轮双盲审查的两份裁决，生成对比分析报告，并给出 recommendation。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `task_id` | `str` | ✅ | 被审查的原始任务 ID |
+
+**返回格式**：
+
+```json
+{
+  "success": true,
+  "round": 1,
+  "judge_a": {
+    "task_id": "review-001",
+    "verdict": "issues",
+    "summary": "发现 1 个严重问题",
+    "findings_count": 1
+  },
+  "judge_b": {
+    "task_id": "review-002",
+    "verdict": "issues",
+    "summary": "发现 2 个问题",
+    "findings_count": 2
+  },
+  "confirmed": [
+    {"desc": "缺少 CSRF 防护", "severity": "CRITICAL", "location": "auth.py:88"}
+  ],
+  "suspect_a": [],
+  "suspect_b": [
+    {"desc": "日志记录过于详细泄露 token", "severity": "WARNING"}
+  ],
+  "both_clean": false,
+  "recommendation": "fix"
+}
+```
+
+**recommendation 值说明**：
+
+| 值 | 含义 | 建议操作 |
+|----|------|----------|
+| `approve` | 双方均无问题 | 可直接调用 `task_verify(approved=true)` |
+| `fix` | 第 1 轮有问题 | Worker 修复后重新提交，再触发第 2 轮 |
+| `escalated` | 第 2 轮仍有问题 | 人工介入，直接 `task_verify` 做最终裁定 |
+
+**错误场景**：
+
+```json
+{"success": false, "error": "该任务没有任何审查任务，请先调用 trigger_judgment_day"}
+{"success": false, "error": "第 1 轮审查尚未完成，待提交的审查任务: ['review-002']"}
+```
+
+---
+
+### 3.9 任务依赖图（DAG）
+
+#### 22. `task_add_dep` — 添加前置依赖
+
+声明 `task_id` 任务在 `depends_on` 完成（`done`）之前不能被领取。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `task_id` | `str` | ✅ | 需要等待前置任务的任务 ID |
+| `depends_on` | `str` | ✅ | 前置任务 ID |
+
+**返回格式**：
+
+```json
+{"ok": true, "task_id": "sub-b", "depends_on": "sub-a", "message": "已添加依赖：sub-b 依赖 sub-a"}
+```
+
+**错误场景**：
+
+```json
+{"ok": false, "error": "添加依赖会形成循环：..."}
+{"ok": false, "error": "任务不能依赖自身"}
+```
+
+---
+
+#### 23. `task_remove_dep` — 移除前置依赖
+
+移除 `task_id` 对 `depends_on` 的前置依赖关系。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `task_id` | `str` | ✅ | 任务 ID |
+| `depends_on` | `str` | ✅ | 要移除的前置任务 ID |
+
+**返回格式**：
+
+```json
+{"ok": true, "task_id": "sub-b", "depends_on": "sub-a", "message": "已移除依赖：sub-b 不再依赖 sub-a"}
+```
+
+---
+
+#### 24. `task_get_deps` — 查询任务依赖关系
+
+获取任务的完整依赖关系：前置依赖、下游依赖、当前阻塞状态。
+
+**参数**：
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `task_id` | `str` | ✅ | 任务 ID |
+
+**返回格式**：
+
+```json
+{
+  "task_id": "sub-b",
+  "depends_on": [{"id": "sub-a", "title": "子任务A", "status": "done"}],
+  "depended_by": [{"id": "sub-c", "title": "子任务C", "status": "pending"}],
+  "blocking": [],
+  "is_blocked": false
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `depends_on` | 前置任务列表（含标题和状态） |
+| `depended_by` | 下游任务列表（依赖该任务的） |
+| `blocking` | 当前阻塞该任务的前置任务 ID 列表 |
+| `is_blocked` | 是否被阻塞（blocking 非空时为 `true`） |
+
+> **注意**：`task_claim` 会自动检查依赖，若 `is_blocked = true` 则领取失败并提示具体阻塞任务。
+
+---
+
 ## 4. 返回格式规范
 
 所有工具遵循统一的返回格式约定：
@@ -1005,6 +1250,13 @@ def serve():
 | 15 | `task_log` | 操作日志 | task_id, limit | ❌ |
 | 16 | `task_test` | 运行测试 | `task_id`*, timeout | ✅ |
 | 17 | `task_health` | 健康检查 | timeout, cleanup | ✅ |
+| 18 | `task_judgment_day` | 触发双盲审查 | `task_id`* | ✅ |
+| 19 | `task_submit_verdict` | 提交审查裁决 | `review_task_id`*, `verdict`*, findings, summary | ✅ |
+| 20 | `task_get_reviews` | 获取审查任务 | `task_id`* | ✅ |
+| 21 | `task_synthesize` | 综合裁决报告 | `task_id`* | ✅ |
+| 22 | `task_add_dep` | 添加前置依赖 | `task_id`*, `depends_on`* | ✅ |
+| 23 | `task_remove_dep` | 移除前置依赖 | `task_id`*, `depends_on`* | ✅ |
+| 24 | `task_get_deps` | 查询依赖关系 | `task_id`* | ✅ |
 
 > `*` 表示必填参数；⭐ 表示含特殊逻辑
 

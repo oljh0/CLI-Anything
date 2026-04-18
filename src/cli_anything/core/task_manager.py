@@ -155,10 +155,18 @@ class TaskManager:
     # ── 任务领取/释放 ──────────────────────────────────────
 
     def claim_task(self, task_id: str) -> Task:
-        """领取任务"""
+        """领取任务（领取前校验所有前置依赖是否已完成）"""
         task = self._get_or_raise(task_id)
         if task.status != TaskStatus.PENDING:
             raise TaskManagerError(f"只能领取 pending 状态的任务，当前状态: {task.status.value}")
+
+        # 依赖检查：前置任务必须全部 done
+        blocking = self.db.list_blocking_deps(task_id)
+        if blocking:
+            raise TaskManagerError(
+                f"任务 {task_id} 有未完成的前置依赖，无法领取。"
+                f"请先完成: {blocking}"
+            )
 
         task.status = TaskStatus.CLAIMED
         task.claimed_by = self.terminal_id
@@ -217,16 +225,43 @@ class TaskManager:
             )
         return self.change_status(task_id, TaskStatus.IN_PROGRESS)
 
-    def submit_task(self, task_id: str) -> Task:
-        """提交任务（in_progress → submitted）"""
+    def submit_task(
+        self,
+        task_id: str,
+        summary: str = "",
+        changed_files: Optional[list[str]] = None,
+        test_note: str = "",
+    ) -> Task:
+        """提交任务（in_progress → submitted），可附带结构化交付信封
+
+        Args:
+            task_id: 任务 ID（必须处于 in_progress 状态）
+            summary: 本次实现内容的一句话摘要（可选）
+            changed_files: 本次修改的文件列表（可选），如 ["src/auth.py", "tests/test_auth.py"]
+            test_note: 测试通过情况的简要说明（可选），如 "全部 10 个测试通过"
+
+        如果提供了信封字段，将合并写入 test_report，不会覆盖 TestRunner 已有的测试数据。
+        """
         task = self._get_or_raise(task_id)
         if task.status != TaskStatus.IN_PROGRESS:
             raise TaskManagerError("只能提交 in_progress 状态的任务")
 
+        # 合并结构化提交信封到 test_report
+        envelope: dict = {}
+        if summary:
+            envelope["submit_summary"] = summary
+        if changed_files:
+            envelope["submit_changed_files"] = changed_files
+        if test_note:
+            envelope["submit_test_note"] = test_note
+        if envelope:
+            task.test_report = {**(task.test_report or {}), **envelope}
+
         task.status = TaskStatus.SUBMITTED
         task.submitted_at = _now_iso()
         self.db.update_task(task)
-        self._log(task_id, "submitted", detail="任务已提交待审核")
+        log_detail = f"任务已提交待审核" + (f": {summary[:60]}" if summary else "")
+        self._log(task_id, "submitted", detail=log_detail)
         self._notify_submit(task)
         return task
 
@@ -422,6 +457,351 @@ class TaskManager:
     def list_terminals(self) -> list[Terminal]:
         """列出所有终端"""
         return self.db.list_terminals()
+
+    # ── 任务依赖图（DAG）────────────────────────────────────
+
+    def add_dependency(self, task_id: str, depends_on_id: str) -> None:
+        """为任务添加前置依赖
+
+        task_id 的任务在 depends_on_id 完成（done）之前无法被领取。
+
+        Args:
+            task_id: 需要等待前置任务完成才能开始的任务 ID
+            depends_on_id: 前置任务 ID（必须先完成）
+
+        Raises:
+            TaskManagerError: 任务不存在、自依赖、或会形成循环依赖
+        """
+        self._get_or_raise(task_id)
+        self._get_or_raise(depends_on_id)
+        if task_id == depends_on_id:
+            raise TaskManagerError("任务不能依赖自身")
+        # 检测循环依赖：depends_on_id 是否已经（直接或间接）依赖 task_id
+        if self._has_path(depends_on_id, task_id):
+            raise TaskManagerError(
+                f"添加依赖会形成循环：{task_id} → {depends_on_id} → ... → {task_id}"
+            )
+        self.db.add_dependency(task_id, depends_on_id)
+        self._log(task_id, "dep_added", detail=f"添加前置依赖: {depends_on_id}")
+
+    def remove_dependency(self, task_id: str, depends_on_id: str) -> None:
+        """移除任务的前置依赖
+
+        Args:
+            task_id: 任务 ID
+            depends_on_id: 要移除的前置任务 ID
+
+        Raises:
+            TaskManagerError: 依赖关系不存在
+        """
+        removed = self.db.remove_dependency(task_id, depends_on_id)
+        if not removed:
+            raise TaskManagerError(
+                f"任务 {task_id} 不存在对 {depends_on_id} 的依赖"
+            )
+        self._log(task_id, "dep_removed", detail=f"移除前置依赖: {depends_on_id}")
+
+    def get_dependencies(self, task_id: str) -> dict:
+        """获取任务的依赖关系详情
+
+        Args:
+            task_id: 任务 ID
+
+        Returns:
+            dict 包含：
+            - depends_on: 该任务依赖的任务列表（前置任务）
+            - depended_by: 依赖该任务的任务列表（下游任务）
+            - blocking: 当前阻塞该任务的前置任务列表（未完成的）
+            - is_blocked: 是否被阻塞
+        """
+        self._get_or_raise(task_id)
+        dep_ids = self.db.list_dependencies(task_id)
+        dependent_ids = self.db.list_dependents(task_id)
+        blocking_ids = self.db.list_blocking_deps(task_id)
+
+        dep_tasks = [self.db.get_task(tid) for tid in dep_ids]
+        dependent_tasks = [self.db.get_task(tid) for tid in dependent_ids]
+
+        def _task_summary(t):
+            if t is None:
+                return None
+            return {"id": t.id, "title": t.title, "status": t.status.value}
+
+        return {
+            "task_id": task_id,
+            "depends_on": [_task_summary(t) for t in dep_tasks if t],
+            "depended_by": [_task_summary(t) for t in dependent_tasks if t],
+            "blocking": blocking_ids,
+            "is_blocked": len(blocking_ids) > 0,
+        }
+
+    def _has_path(self, from_id: str, to_id: str) -> bool:
+        """BFS 检测从 from_id 出发是否能到达 to_id（用于循环检测）"""
+        visited: set[str] = set()
+        queue = [from_id]
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            for dep in self.db.list_dependencies(current):
+                if dep == to_id:
+                    return True
+                queue.append(dep)
+        return False
+
+    # ── Judgment Day 双盲对抗审查 ────────────────────────────────
+
+    def trigger_judgment_day(self, task_id: str) -> tuple[Task, Task]:
+        """为 submitted 状态的任务启动双盲对抗审查
+
+        创建 Judge A 和 Judge B 两个独立审查任务（REVIEW 类型），
+        供两个不同的 Worker 终端各自认领、独立审查，互不知晓对方结论。
+
+        Args:
+            task_id: 待审查的任务 ID（必须处于 submitted 状态）
+
+        Returns:
+            (judge_a_task, judge_b_task)
+
+        Raises:
+            TaskManagerError: 如果任务状态不是 submitted，或已有活跃审查，或超过最大轮次
+        """
+        task = self._get_or_raise(task_id)
+        if task.status != TaskStatus.SUBMITTED:
+            raise TaskManagerError(
+                f"只能对 submitted 状态的任务发起 Judgment Day，当前状态: {task.status.value}"
+            )
+
+        # 获取所有已有审查任务，检查是否有活跃审查
+        existing = self.db.list_tasks(parent_id=task_id, task_type=TaskType.REVIEW.value, limit=100)
+        active = [t for t in existing if t.status not in (TaskStatus.DONE, TaskStatus.CANCELLED, TaskStatus.SUBMITTED)]
+        if active:
+            raise TaskManagerError(
+                f"该任务已有 {len(active)} 个进行中的审查任务，请等待当前轮次完成后再触发"
+            )
+
+        # 已完成的轮次数 = 已提交审查任务对数
+        submitted = [t for t in existing if t.status == TaskStatus.SUBMITTED]
+        current_round = len(submitted) // 2 + 1
+        if current_round > 2:
+            raise TaskManagerError(
+                "已达到最大审查轮次（2 轮），建议人工介入处理或直接验收"
+            )
+
+        # 在原始任务上打标记
+        if "judgment-day" not in task.tags:
+            task.tags.append("judgment-day")
+        round_tag = f"jd-round-{current_round}"
+        if round_tag not in task.tags:
+            task.tags.append(round_tag)
+        self.db.update_task(task)
+
+        # 创建 Judge A 审查任务
+        judge_a = self.create_task(
+            title=f"【Judgment Day R{current_round}】Judge A 审查 #{task_id}",
+            description=(
+                f"## 双盲对抗审查 — Judge A（第 {current_round} 轮）\n\n"
+                f"**待审查任务**: #{task_id} — {task.title}\n\n"
+                f"**重要规则**：独立审查，不得查看 Judge B 的结论，不得与其他审查者沟通。\n\n"
+                f"**审查维度**：正确性 / 边界情况 / 错误处理 / 性能 / 安全性 / 命名与约定\n\n"
+                f"审查完成后调用 `task_submit_verdict` 提交裁决，"
+                f"verdict 为 'clean'（无问题）或 'issues'（有问题）。"
+            ),
+            task_type=TaskType.REVIEW,
+            parent_id=task_id,
+            tags=["jd-judge-a", round_tag],
+        )
+
+        # 创建 Judge B 审查任务
+        judge_b = self.create_task(
+            title=f"【Judgment Day R{current_round}】Judge B 审查 #{task_id}",
+            description=(
+                f"## 双盲对抗审查 — Judge B（第 {current_round} 轮）\n\n"
+                f"**待审查任务**: #{task_id} — {task.title}\n\n"
+                f"**重要规则**：独立审查，不得查看 Judge A 的结论，不得与其他审查者沟通。\n\n"
+                f"**审查维度**：正确性 / 边界情况 / 错误处理 / 性能 / 安全性 / 命名与约定\n\n"
+                f"审查完成后调用 `task_submit_verdict` 提交裁决，"
+                f"verdict 为 'clean'（无问题）或 'issues'（有问题）。"
+            ),
+            task_type=TaskType.REVIEW,
+            parent_id=task_id,
+            tags=["jd-judge-b", round_tag],
+        )
+
+        self._log(
+            task_id,
+            "judgment_day_triggered",
+            detail=f"Round {current_round}: Judge A={judge_a.id}, Judge B={judge_b.id}",
+        )
+        return judge_a, judge_b
+
+    def submit_verdict(
+        self,
+        review_task_id: str,
+        verdict: str,
+        findings: Optional[list[dict]] = None,
+        summary: str = "",
+    ) -> Task:
+        """Worker 提交审查裁决
+
+        将裁决结果（verdict + findings）存入 test_report，并将审查任务状态变为 submitted。
+
+        Args:
+            review_task_id: 审查任务 ID（task_type 必须是 review）
+            verdict: "clean"（无问题）或 "issues"（发现问题）
+            findings: 发现的问题列表，每项格式：
+                      {"desc": "描述", "severity": "CRITICAL|WARNING|SUGGESTION", "location": "文件:行号"}
+            summary: 一句话总结（可选）
+
+        Raises:
+            TaskManagerError: 如果任务类型不是 review，状态不对，或 verdict 值不合法
+        """
+        review_task = self._get_or_raise(review_task_id)
+        if review_task.task_type != TaskType.REVIEW:
+            raise TaskManagerError("只能对 review 类型的任务提交裁决")
+        if verdict not in ("clean", "issues"):
+            raise TaskManagerError("verdict 必须是 'clean' 或 'issues'")
+        if review_task.status not in (TaskStatus.CLAIMED, TaskStatus.IN_PROGRESS):
+            raise TaskManagerError(
+                f"审查任务必须处于 claimed 或 in_progress 状态，当前: {review_task.status.value}"
+            )
+
+        # 若还在 claimed，先自动过渡到 in_progress
+        if review_task.status == TaskStatus.CLAIMED:
+            review_task.status = TaskStatus.IN_PROGRESS
+            self.db.update_task(review_task)
+
+        # 存储裁决到 test_report
+        review_task.test_report = {
+            "verdict": verdict,
+            "findings": findings or [],
+            "summary": summary,
+        }
+        review_task.status = TaskStatus.SUBMITTED
+        review_task.submitted_at = _now_iso()
+        self.db.update_task(review_task)
+        self._log(
+            review_task_id,
+            "verdict_submitted",
+            detail=f"裁决: {verdict}, 发现 {len(findings or [])} 个问题",
+        )
+        return review_task
+
+    def get_review_tasks(self, task_id: str) -> list[Task]:
+        """获取某任务的所有审查任务（按创建时间升序）
+
+        Args:
+            task_id: 被审查的原始任务 ID
+        """
+        return self.db.list_tasks(parent_id=task_id, task_type=TaskType.REVIEW.value, limit=100)
+
+    def synthesize_judgment(self, task_id: str) -> dict:
+        """综合两份审查裁决，生成对比分析报告
+
+        比较 Judge A 和 Judge B 的发现，分类为：
+        - confirmed：两者都发现的问题（高置信度）
+        - suspect_a：只有 Judge A 发现的
+        - suspect_b：只有 Judge B 发现的
+
+        Args:
+            task_id: 被审查的原始任务 ID
+
+        Returns:
+            synthesis 报告字典，包含 recommendation（"approve"/"fix"/"escalated"）
+
+        Raises:
+            TaskManagerError: 如果审查任务不存在或尚未全部提交
+        """
+        self._get_or_raise(task_id)
+
+        all_reviews = self.db.list_tasks(parent_id=task_id, task_type=TaskType.REVIEW.value, limit=100)
+        if not all_reviews:
+            raise TaskManagerError("该任务没有任何审查任务，请先调用 trigger_judgment_day")
+
+        # 提取轮次信息，找最大轮次
+        def _extract_round(t: Task) -> int:
+            for tag in t.tags:
+                if tag.startswith("jd-round-"):
+                    try:
+                        return int(tag.split("-")[-1])
+                    except ValueError:
+                        pass
+            return 0
+
+        max_round = max(_extract_round(t) for t in all_reviews)
+        if max_round == 0:
+            raise TaskManagerError("审查任务缺少 jd-round-N 标签，无法确认轮次")
+
+        latest = [t for t in all_reviews if _extract_round(t) == max_round]
+        submitted = [t for t in latest if t.status == TaskStatus.SUBMITTED]
+        if len(submitted) < 2:
+            pending_ids = [t.id for t in latest if t.status != TaskStatus.SUBMITTED]
+            raise TaskManagerError(
+                f"第 {max_round} 轮审查尚未完成，待提交的审查任务: {pending_ids}"
+            )
+
+        judge_a = next((t for t in submitted if "jd-judge-a" in t.tags), None)
+        judge_b = next((t for t in submitted if "jd-judge-b" in t.tags), None)
+        if not judge_a or not judge_b:
+            raise TaskManagerError("无法区分 Judge A 和 Judge B，请检查审查任务的 tags")
+
+        report_a = judge_a.test_report
+        report_b = judge_b.test_report
+        verdict_a = report_a.get("verdict", "unknown")
+        verdict_b = report_b.get("verdict", "unknown")
+        findings_a: list[dict] = report_a.get("findings", [])
+        findings_b: list[dict] = report_b.get("findings", [])
+
+        # 简单键匹配：取 desc 前 40 字符，规范化空白
+        def _key(f: dict) -> str:
+            return " ".join(f.get("desc", "").lower().split())[:40]
+
+        keys_b = {_key(f) for f in findings_b}
+        confirmed = [f for f in findings_a if _key(f) in keys_b]
+        suspect_a = [f for f in findings_a if _key(f) not in keys_b]
+        keys_a = {_key(f) for f in findings_a}
+        suspect_b = [f for f in findings_b if _key(f) not in keys_a]
+
+        both_clean = (verdict_a == "clean" and verdict_b == "clean")
+        if both_clean:
+            recommendation = "approve"
+        elif max_round >= 2:
+            recommendation = "escalated"
+        else:
+            recommendation = "fix"
+
+        result = {
+            "round": max_round,
+            "judge_a": {
+                "task_id": judge_a.id,
+                "verdict": verdict_a,
+                "summary": report_a.get("summary", ""),
+                "findings_count": len(findings_a),
+            },
+            "judge_b": {
+                "task_id": judge_b.id,
+                "verdict": verdict_b,
+                "summary": report_b.get("summary", ""),
+                "findings_count": len(findings_b),
+            },
+            "confirmed": confirmed,
+            "suspect_a": suspect_a,
+            "suspect_b": suspect_b,
+            "both_clean": both_clean,
+            "recommendation": recommendation,
+        }
+
+        self._log(
+            task_id,
+            "judgment_synthesized",
+            detail=(
+                f"Round {max_round}: confirmed={len(confirmed)}, "
+                f"suspect_a={len(suspect_a)}, suspect_b={len(suspect_b)}, "
+                f"recommendation={recommendation}"
+            ),
+        )
+        return result
 
     # ── 内部辅助 ──────────────────────────────────────────
 

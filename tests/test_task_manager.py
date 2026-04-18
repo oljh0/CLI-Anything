@@ -288,3 +288,49 @@ class TestReviewWorkflow:
         task = tm.create_task("草稿任务", reviewer="reviewer-1")
         with pytest.raises(TaskManagerError, match="pending"):
             tm.claim_task(task.id)
+
+
+class TestSubmitEnvelope:
+    """P1 结构化提交信封测试"""
+
+    @pytest.fixture
+    def in_progress_task(self, tm):
+        task = tm.create_task(title="实现登录模块")
+        tm.claim_task(task.id)
+        tm.start_task(task.id)
+        return tm.get_task(task.id)
+
+    def test_submit_without_envelope(self, tm, in_progress_task):
+        """不带信封的提交，行为与以前相同"""
+        result = tm.submit_task(in_progress_task.id)
+        assert result.status == TaskStatus.SUBMITTED
+
+    def test_submit_with_summary(self, tm, in_progress_task):
+        """带 summary 的提交，存入 test_report"""
+        result = tm.submit_task(in_progress_task.id, summary="实现了 JWT 登录")
+        assert result.test_report["submit_summary"] == "实现了 JWT 登录"
+
+    def test_submit_with_changed_files(self, tm, in_progress_task):
+        """带 changed_files 的提交"""
+        files = ["src/auth.py", "tests/test_auth.py"]
+        result = tm.submit_task(in_progress_task.id, changed_files=files)
+        assert result.test_report["submit_changed_files"] == files
+
+    def test_submit_with_test_note(self, tm, in_progress_task):
+        """带 test_note 的提交"""
+        result = tm.submit_task(in_progress_task.id, test_note="全部 15 个测试通过")
+        assert result.test_report["submit_test_note"] == "全部 15 个测试通过"
+
+    def test_envelope_merges_with_existing_test_report(self, tm, in_progress_task):
+        """信封与 TestRunner 已有数据合并，不覆盖"""
+        from cli_anything.core.models import TestStatus
+        tm.update_test_result(in_progress_task.id, TestStatus.PASSED, {"total": 10, "passed": 10})
+        result = tm.submit_task(in_progress_task.id, summary="功能完成")
+        r = result.test_report
+        assert r["total"] == 10
+        assert r["submit_summary"] == "功能完成"
+
+    def test_empty_envelope_not_written(self, tm, in_progress_task):
+        """空值不写入 test_report"""
+        result = tm.submit_task(in_progress_task.id, summary="", changed_files=None, test_note="")
+        assert (result.test_report or {}).get("submit_summary") is None

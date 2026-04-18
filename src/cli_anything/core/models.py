@@ -14,6 +14,7 @@ class TaskType(str, Enum):
     """任务类型"""
     MASTER = "master"
     SUBTASK = "subtask"
+    REVIEW = "review"  # 双盲对抗审查任务（Judgment Day）
 
 
 class TaskStatus(str, Enum):

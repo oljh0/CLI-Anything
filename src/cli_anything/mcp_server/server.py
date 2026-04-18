@@ -230,11 +230,19 @@ def task_start(task_id: str) -> dict:
 
 
 @mcp.tool()
-def task_submit(task_id: str) -> dict:
-    """提交已完成的任务
+def task_submit(
+    task_id: str,
+    summary: str = "",
+    changed_files: list = None,
+    test_note: str = "",
+) -> dict:
+    """提交已完成的任务，可附带结构化交付信封
 
     Args:
         task_id: 任务 ID
+        summary: 实现内容摘要（推荐填写），如"实现了用户登录接口，支持 OAuth2"
+        changed_files: 本次修改的文件列表，如 ["src/auth.py", "tests/test_auth.py"]
+        test_note: 测试通过情况说明，如"全部 12 个测试通过，覆盖率 87%"
     """
     tm = _get_tm()
     try:
@@ -244,8 +252,13 @@ def task_submit(task_id: str) -> dict:
         # 如果还在 claimed，自动过渡到 in_progress
         if task.status == TaskStatus.CLAIMED:
             tm.start_task(task_id)
-        tm.submit_task(task_id)
-        return {"success": True, "task_id": task_id, "status": "submitted"}
+        task = tm.submit_task(task_id, summary=summary, changed_files=changed_files, test_note=test_note)
+        result: dict = {"success": True, "task_id": task_id, "status": "submitted"}
+        if task.test_report:
+            envelope = {k: v for k, v in task.test_report.items() if k.startswith("submit_")}
+            if envelope:
+                result["envelope"] = envelope
+        return result
     except TaskManagerError as e:
         return {"success": False, "error": str(e)}
 
@@ -493,6 +506,168 @@ def task_health(
         result["released_count"] = len(released)
 
     return result
+
+
+@mcp.tool()
+def task_judgment_day(task_id: str) -> dict:
+    """为 submitted 状态的任务启动双盲对抗审查（Judgment Day）
+
+    创建两个独立的 REVIEW 任务（Judge A 和 Judge B），
+    供不同 Worker 独立认领并审查，互不知晓对方结论。
+
+    Args:
+        task_id: 待审查的任务 ID（必须处于 submitted 状态）
+    """
+    tm = _get_tm()
+    try:
+        judge_a, judge_b = tm.trigger_judgment_day(task_id)
+        return {
+            "success": True,
+            "task_id": task_id,
+            "judge_a": {"id": judge_a.id, "title": judge_a.title, "status": judge_a.status.value},
+            "judge_b": {"id": judge_b.id, "title": judge_b.title, "status": judge_b.status.value},
+            "message": "双盲审查已启动，请由两个不同的 Worker 分别认领 judge_a 和 judge_b 任务",
+        }
+    except TaskManagerError as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def task_submit_verdict(
+    review_task_id: str,
+    verdict: str,
+    findings: list = None,
+    summary: str = "",
+) -> dict:
+    """提交审查裁决（在 claimed 或 in_progress 的 review 任务上调用）
+
+    Args:
+        review_task_id: 审查任务 ID（task_type 为 review）
+        verdict: "clean"（无问题）或 "issues"（发现问题）
+        findings: 发现的问题列表，每项格式:
+                  [{"desc": "问题描述", "severity": "CRITICAL|WARNING|SUGGESTION", "location": "文件:行号"}]
+        summary: 一句话审查总结
+    """
+    tm = _get_tm()
+    try:
+        task = tm.submit_verdict(
+            review_task_id=review_task_id,
+            verdict=verdict,
+            findings=findings,
+            summary=summary,
+        )
+        return {
+            "success": True,
+            "review_task_id": review_task_id,
+            "verdict": verdict,
+            "findings_count": len(findings or []),
+            "status": task.status.value,
+        }
+    except TaskManagerError as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def task_get_reviews(task_id: str) -> dict:
+    """获取某任务的所有审查任务
+
+    Args:
+        task_id: 被审查的原始任务 ID
+    """
+    tm = _get_tm()
+    reviews = tm.get_review_tasks(task_id)
+    return {
+        "success": True,
+        "task_id": task_id,
+        "count": len(reviews),
+        "reviews": [
+            {
+                "id": t.id,
+                "title": t.title,
+                "status": t.status.value,
+                "tags": t.tags,
+                "verdict": (t.test_report or {}).get("verdict"),
+            }
+            for t in reviews
+        ],
+    }
+
+
+@mcp.tool()
+def task_synthesize(task_id: str) -> dict:
+    """综合两份审查裁决，生成对比分析报告
+
+    对比 Judge A 和 Judge B 的发现，分类为 confirmed / suspect_a / suspect_b，
+    并给出 recommendation（approve / fix / escalated）。
+
+    Args:
+        task_id: 被审查的原始任务 ID
+    """
+    tm = _get_tm()
+    try:
+        result = tm.synthesize_judgment(task_id)
+        return {"success": True, **result}
+    except TaskManagerError as e:
+        return {"success": False, "error": str(e)}
+
+
+# ── 任务依赖图（DAG）────────────────────────────────────────────
+
+@mcp.tool()
+def task_add_dep(task_id: str, depends_on: str) -> dict:
+    """为任务添加前置依赖（task_id 必须等待 depends_on 完成后才能被领取）
+
+    Args:
+        task_id: 需要等待前置任务的任务 ID
+        depends_on: 前置任务 ID（必须先 done）
+
+    Returns:
+        操作确认信息
+    """
+    tm = _get_tm()
+    try:
+        tm.add_dependency(task_id, depends_on)
+        return {"ok": True, "task_id": task_id, "depends_on": depends_on,
+                "message": f"已添加依赖：{task_id} 依赖 {depends_on}"}
+    except TaskManagerError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+def task_remove_dep(task_id: str, depends_on: str) -> dict:
+    """移除任务的前置依赖
+
+    Args:
+        task_id: 任务 ID
+        depends_on: 要移除的前置任务 ID
+
+    Returns:
+        操作确认信息
+    """
+    tm = _get_tm()
+    try:
+        tm.remove_dependency(task_id, depends_on)
+        return {"ok": True, "task_id": task_id, "depends_on": depends_on,
+                "message": f"已移除依赖：{task_id} 不再依赖 {depends_on}"}
+    except TaskManagerError as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool()
+def task_get_deps(task_id: str) -> dict:
+    """获取任务的依赖关系详情（前置依赖、下游依赖、当前阻塞状态）
+
+    Args:
+        task_id: 任务 ID
+
+    Returns:
+        依赖关系信息：depends_on（前置）、depended_by（下游）、blocking（阻塞列表）、is_blocked
+    """
+    tm = _get_tm()
+    try:
+        return tm.get_dependencies(task_id)
+    except TaskManagerError as e:
+        return {"ok": False, "error": str(e)}
 
 
 # ── 启动入口 ────────────────────────────────────────────────

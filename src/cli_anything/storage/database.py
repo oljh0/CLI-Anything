@@ -123,6 +123,15 @@ CREATE TABLE IF NOT EXISTS terminals (
     last_active   TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     registered_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS task_deps (
+    task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, depends_on)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_deps_task ON task_deps(task_id);
+CREATE INDEX IF NOT EXISTS idx_task_deps_on ON task_deps(depends_on);
 """
 
 
@@ -164,6 +173,7 @@ class Database:
                 conn.executescript(_SCHEMA_SQL)
                 conn.commit()
                 self._migrate_review_columns_on(conn)
+                self._migrate_task_deps_on(conn)
                 self._schema_initialized = True
 
         self._local.conn = conn
@@ -186,6 +196,19 @@ class Database:
     def _migrate_review_columns(self):
         """兼容旧调用"""
         self._migrate_review_columns_on(self.conn)
+
+    def _migrate_task_deps_on(self, conn: sqlite3.Connection):
+        """为已有数据库创建 task_deps 表（幂等）"""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_deps (
+                task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                depends_on  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                PRIMARY KEY (task_id, depends_on)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_deps_task ON task_deps(task_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_task_deps_on ON task_deps(depends_on)")
+        conn.commit()
 
     def close(self):
         """关闭当前线程的数据库连接"""
@@ -390,3 +413,53 @@ class Database:
         """获取所有终端"""
         cur = self.conn.execute("SELECT * FROM terminals ORDER BY last_active DESC")
         return [Terminal.from_row(dict(row)) for row in cur.fetchall()]
+
+    # ── TaskDep CRUD ─────────────────────────────────────────
+
+    @retry_on_lock
+    def add_dependency(self, task_id: str, depends_on: str) -> None:
+        """添加任务依赖关系（幂等）"""
+        with self._lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO task_deps (task_id, depends_on) VALUES (?, ?)",
+                (task_id, depends_on),
+            )
+            self.conn.commit()
+
+    @retry_on_lock
+    def remove_dependency(self, task_id: str, depends_on: str) -> bool:
+        """删除任务依赖关系，返回是否删除了记录"""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM task_deps WHERE task_id = ? AND depends_on = ?",
+                (task_id, depends_on),
+            )
+            self.conn.commit()
+        return cur.rowcount > 0
+
+    def list_dependencies(self, task_id: str) -> list[str]:
+        """获取 task_id 依赖的所有任务 ID 列表"""
+        cur = self.conn.execute(
+            "SELECT depends_on FROM task_deps WHERE task_id = ?", (task_id,)
+        )
+        return [row["depends_on"] for row in cur.fetchall()]
+
+    def list_dependents(self, task_id: str) -> list[str]:
+        """获取所有依赖 task_id 的任务 ID 列表（下游任务）"""
+        cur = self.conn.execute(
+            "SELECT task_id FROM task_deps WHERE depends_on = ?", (task_id,)
+        )
+        return [row["task_id"] for row in cur.fetchall()]
+
+    def list_blocking_deps(self, task_id: str) -> list[str]:
+        """获取阻塞 task_id 的依赖任务 ID（即尚未 done 的前置任务）"""
+        cur = self.conn.execute(
+            """
+            SELECT td.depends_on
+            FROM task_deps td
+            JOIN tasks t ON td.depends_on = t.id
+            WHERE td.task_id = ? AND t.status != 'done'
+            """,
+            (task_id,),
+        )
+        return [row["depends_on"] for row in cur.fetchall()]
