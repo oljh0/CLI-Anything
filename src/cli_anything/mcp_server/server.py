@@ -517,27 +517,107 @@ def task_judgment_day(task_id: str, project_standards: str = "") -> dict:
     创建两个独立的 REVIEW 任务（Judge A 和 Judge B），
     供不同 Worker 独立认领并审查，互不知晓对方结论。
 
+    项目规范自动注入（Skill Registry 风格）：
+    若未传 project_standards，将自动按优先级扫描项目中的规范文件：
+    .atl/skill-registry.md → CLAUDE.md → AGENTS.md →
+    .github/copilot-instructions.md → .copilot/instructions.md。
+    找到内容则自动注入到两个 judge 任务描述中。
+
     Args:
         task_id: 待审查的任务 ID（必须处于 submitted 状态）
         project_standards: 可选的项目规范摘要（代码风格/约定/禁忌），
-                           会注入到两个 judge 任务描述中，让 AI judge 按
-                           项目标准审查，而非泛化最佳实践。
+                           若留空则自动从任务的 work_dir 读取规范文件。
                            示例: "使用 Python 3.10+类型注解，函数注释用中文，
                                   禁止直接操作 DB 绕过 TaskManager"
     """
     tm = _get_tm()
     try:
         judge_a, judge_b = tm.trigger_judgment_day(task_id, project_standards=project_standards)
+        # 记录实际是否注入了规范（可能来自自动扫描）
+        auto_scanned = not bool(project_standards.strip())
+        standards_injected = bool(judge_a.description and "项目规范" in judge_a.description)
         return {
             "success": True,
             "task_id": task_id,
             "judge_a": {"id": judge_a.id, "title": judge_a.title, "status": judge_a.status.value},
             "judge_b": {"id": judge_b.id, "title": judge_b.title, "status": judge_b.status.value},
             "message": "双盲审查已启动，请由两个不同的 Worker 分别认领 judge_a 和 judge_b 任务",
-            "standards_injected": bool(project_standards.strip()),
+            "standards_injected": standards_injected,
+            "standards_auto_scanned": auto_scanned and standards_injected,
         }
     except TaskManagerError as e:
         return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def task_get_project_standards(work_dir: str = "") -> dict:
+    """扫描项目规范文件并返回内容（Skill Registry 风格）
+
+    按优先级扫描项目根目录中的规范文件：
+    .atl/skill-registry.md → CLAUDE.md → AGENTS.md →
+    .github/copilot-instructions.md → .copilot/instructions.md
+
+    可用于在手动调用 task_judgment_day 前预览将要注入的规范内容。
+
+    Args:
+        work_dir: 项目根目录路径。为空时使用当前工作目录。
+    """
+    tm = _get_tm()
+    content = tm.get_project_standards(work_dir)
+    return {
+        "found": bool(content),
+        "content": content,
+        "work_dir": work_dir or str(__import__("pathlib").Path.cwd()),
+    }
+
+
+@mcp.tool()
+def task_add_note(task_id: str, note: str, note_type: str = "general") -> dict:
+    """为任务追加上下文笔记（Engram 风格）
+
+    记录任务执行过程中的关键决策、技术发现、潜在风险等信息，
+    供后续 Worker 或 Master 查阅。笔记不影响任务状态。
+
+    Args:
+        task_id: 任务 ID
+        note: 笔记内容
+        note_type: 类型，建议值：
+                   "discovery"（技术发现）、"decision"（设计决策）、
+                   "warning"（潜在风险）、"context"（上下文背景）、"general"（通用）
+    """
+    tm = _get_tm()
+    try:
+        task = tm.add_task_note(task_id, note, note_type)
+        notes = task.test_report.get("task_notes", [])
+        return {
+            "success": True,
+            "task_id": task_id,
+            "notes_count": len(notes),
+            "latest_note": notes[-1] if notes else None,
+        }
+    except TaskManagerError as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def task_get_notes(task_id: str) -> dict:
+    """获取任务的所有上下文笔记
+
+    Args:
+        task_id: 任务 ID
+    """
+    tm = _get_tm()
+    try:
+        notes = tm.get_task_notes(task_id)
+        return {
+            "success": True,
+            "task_id": task_id,
+            "notes_count": len(notes),
+            "notes": notes,
+        }
+    except TaskManagerError as e:
+        return {"success": False, "error": str(e)}
+
 
 
 @mcp.tool()

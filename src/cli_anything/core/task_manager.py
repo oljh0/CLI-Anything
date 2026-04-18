@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from cli_anything.core.models import (
@@ -57,6 +58,7 @@ class TaskManager:
         task_type: TaskType = TaskType.MASTER,
         parent_id: Optional[str] = None,
         reviewer: Optional[str] = None,
+        work_dir: str = "",
     ) -> Task:
         """创建新任务
 
@@ -87,6 +89,7 @@ class TaskManager:
             status=initial_status,
             reviewer=reviewer,
             review_status=review_status,
+            work_dir=work_dir,
         )
         
         # 使用批量事务同时插入任务和日志，减少锁竞争
@@ -710,6 +713,10 @@ class TaskManager:
             task.tags.append(round_tag)
         self.db.update_task(task)
 
+        # 若未提供 project_standards，自动扫描项目规范文件（Skill Registry 风格）
+        if not project_standards.strip():
+            project_standards = self.get_project_standards(task.work_dir)
+
         # 构建可选的项目规范注入块
         standards_block = ""
         if project_standards.strip():
@@ -926,6 +933,98 @@ class TaskManager:
             ),
         )
         return result
+
+    # ── Skill Registry 与任务笔记 ─────────────────────────────
+
+    _STANDARDS_MAX_CHARS = 4000
+    _STANDARDS_CANDIDATES = [
+        Path(".atl") / "skill-registry.md",
+        Path("CLAUDE.md"),
+        Path("AGENTS.md"),
+        Path(".github") / "copilot-instructions.md",
+        Path(".copilot") / "instructions.md",
+    ]
+
+    def get_project_standards(self, work_dir: str = "") -> str:
+        """自动读取项目规范文件（Skill Registry 风格）
+
+        按优先级扫描：.atl/skill-registry.md → CLAUDE.md → AGENTS.md →
+        .github/copilot-instructions.md → .copilot/instructions.md。
+        返回第一个找到的文件内容（内容超过 4000 字符时截断）。
+
+        Args:
+            work_dir: 项目根目录。为空时使用当前工作目录。
+
+        Returns:
+            规范文件内容字符串，未找到任何文件时返回空字符串。
+        """
+        base = Path(work_dir).resolve() if work_dir else Path.cwd()
+        for rel in self._STANDARDS_CANDIDATES:
+            path = base / rel
+            if path.is_file():
+                content = path.read_text(encoding="utf-8", errors="replace").strip()
+                if content:
+                    if len(content) > self._STANDARDS_MAX_CHARS:
+                        content = content[: self._STANDARDS_MAX_CHARS] + "\n...(内容已截断)"
+                    return content
+        return ""
+
+    def add_task_note(
+        self,
+        task_id: str,
+        note: str,
+        note_type: str = "general",
+    ) -> Task:
+        """为任务追加上下文笔记（Engram 风格）
+
+        记录任务执行过程中的关键决策、技术发现、潜在风险等信息，
+        供后续 Worker 或 Master 查阅，笔记追加写入 test_report["task_notes"]。
+
+        Args:
+            task_id: 任务 ID
+            note: 笔记内容（不限长度）
+            note_type: 类型，建议值：
+                       "discovery"（技术发现）、"decision"（设计决策）、
+                       "warning"（潜在风险）、"context"（上下文背景）、"general"（通用）
+
+        Returns:
+            更新后的 Task 对象
+
+        Raises:
+            TaskManagerError: 任务不存在或笔记内容为空
+        """
+        task = self._get_or_raise(task_id)
+        if not note.strip():
+            raise TaskManagerError("笔记内容不能为空")
+
+        notes_list = list(task.test_report.get("task_notes", []))
+        notes_list.append(
+            {
+                "type": note_type,
+                "content": note.strip(),
+                "terminal_id": self.terminal_id,
+                "timestamp": _now_iso(),
+            }
+        )
+        task.test_report = {**(task.test_report or {}), "task_notes": notes_list}
+        self.db.update_task(task)
+        self._log(task_id, "note_added", detail=f"[{note_type}] {note[:60]}")
+        return task
+
+    def get_task_notes(self, task_id: str) -> list[dict]:
+        """获取任务的所有上下文笔记
+
+        Args:
+            task_id: 任务 ID
+
+        Returns:
+            笔记列表，每项包含 type / content / terminal_id / timestamp
+
+        Raises:
+            TaskManagerError: 任务不存在
+        """
+        task = self._get_or_raise(task_id)
+        return list(task.test_report.get("task_notes", []))
 
     # ── 内部辅助 ──────────────────────────────────────────
 

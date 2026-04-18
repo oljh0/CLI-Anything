@@ -19,9 +19,13 @@ def tm(db):
 
 
 @pytest.fixture
-def submitted_task(tm):
-    """创建一个已提交的任务用于审查"""
-    task = tm.create_task(title="待审查的功能实现", description="实现了某个功能")
+def submitted_task(tm, tmp_path):
+    """创建一个已提交的任务用于审查（work_dir 指向空临时目录，确保测试隔离）"""
+    task = tm.create_task(
+        title="待审查的功能实现",
+        description="实现了某个功能",
+        work_dir=str(tmp_path),
+    )
     tm.claim_task(task.id)
     tm.start_task(task.id)
     tm.submit_task(task.id)
@@ -333,6 +337,127 @@ class TestProjectStandardsInjection:
 
         assert "项目规范" not in judge_a.description
         assert "项目规范" not in judge_b.description
+
+
+class TestSkillRegistryAutoRead:
+    """get_project_standards 文件扫描与自动注入测试"""
+
+    def test_reads_claude_md(self, tm, tmp_path):
+        """在目录中放置 CLAUDE.md 时，应返回其内容"""
+        (tmp_path / "CLAUDE.md").write_text("# 项目规范\n不得直接操作 DB", encoding="utf-8")
+        result = tm.get_project_standards(str(tmp_path))
+        assert "不得直接操作 DB" in result
+
+    def test_atl_skill_registry_takes_priority_over_claude_md(self, tm, tmp_path):
+        """同时存在 .atl/skill-registry.md 和 CLAUDE.md 时，应优先读取前者"""
+        atl_dir = tmp_path / ".atl"
+        atl_dir.mkdir()
+        (atl_dir / "skill-registry.md").write_text("来自 skill-registry", encoding="utf-8")
+        (tmp_path / "CLAUDE.md").write_text("来自 CLAUDE.md", encoding="utf-8")
+        result = tm.get_project_standards(str(tmp_path))
+        assert "来自 skill-registry" in result
+        assert "来自 CLAUDE.md" not in result
+
+    def test_returns_empty_when_no_files_found(self, tm, tmp_path):
+        """目录中没有任何规范文件时，应返回空字符串"""
+        result = tm.get_project_standards(str(tmp_path))
+        assert result == ""
+
+    def test_content_truncated_at_4000_chars(self, tm, tmp_path):
+        """内容超过 4000 字符时，应截断并追加提示"""
+        long_content = "x" * 5000
+        (tmp_path / "CLAUDE.md").write_text(long_content, encoding="utf-8")
+        result = tm.get_project_standards(str(tmp_path))
+        assert len(result) < 5000
+        assert "...(内容已截断)" in result
+
+    def test_auto_injects_when_project_standards_empty_and_work_dir_has_file(
+        self, tm, tmp_path
+    ):
+        """trigger_judgment_day 未传 project_standards 时，应自动读取 work_dir 中的规范"""
+        (tmp_path / "CLAUDE.md").write_text("自动注入的规范内容", encoding="utf-8")
+        # 创建 work_dir 指向 tmp_path 的已提交任务
+        task = tm.create_task(title="带工作目录的任务", work_dir=str(tmp_path))
+        tm.claim_task(task.id)
+        tm.start_task(task.id)
+        tm.submit_task(task.id)
+
+        judge_a, judge_b = tm.trigger_judgment_day(task.id)
+        assert "自动注入的规范内容" in judge_a.description
+        assert "自动注入的规范内容" in judge_b.description
+
+    def test_manual_standards_override_auto_read(self, tm, tmp_path):
+        """显式传入 project_standards 时，不应被文件内容覆盖"""
+        (tmp_path / "CLAUDE.md").write_text("文件中的规范", encoding="utf-8")
+        task = tm.create_task(title="任务", work_dir=str(tmp_path))
+        tm.claim_task(task.id)
+        tm.start_task(task.id)
+        tm.submit_task(task.id)
+
+        manual = "手动传入的规范"
+        judge_a, _ = tm.trigger_judgment_day(task.id, project_standards=manual)
+        assert manual in judge_a.description
+        assert "文件中的规范" not in judge_a.description
+
+
+class TestTaskNotes:
+    """add_task_note / get_task_notes 任务上下文笔记测试"""
+
+    def _make_task(self, tm):
+        task = tm.create_task(title="带笔记的任务")
+        tm.claim_task(task.id)
+        tm.start_task(task.id)
+        return tm.get_task(task.id)
+
+    def test_add_note_basic(self, tm):
+        """添加一条笔记后，test_report 中应包含该笔记"""
+        task = self._make_task(tm)
+        updated = tm.add_task_note(task.id, "发现了一个边界条件")
+        notes = updated.test_report.get("task_notes", [])
+        assert len(notes) == 1
+        assert notes[0]["content"] == "发现了一个边界条件"
+        assert notes[0]["type"] == "general"
+
+    def test_add_note_with_type(self, tm):
+        """note_type 字段应正确保存"""
+        task = self._make_task(tm)
+        tm.add_task_note(task.id, "决定使用 BFS", note_type="decision")
+        notes = tm.get_task_notes(task.id)
+        assert notes[0]["type"] == "decision"
+
+    def test_add_multiple_notes_accumulates(self, tm):
+        """多次添加笔记，应按顺序累积，不覆盖旧笔记"""
+        task = self._make_task(tm)
+        tm.add_task_note(task.id, "第一条笔记")
+        tm.add_task_note(task.id, "第二条笔记")
+        tm.add_task_note(task.id, "第三条笔记")
+        notes = tm.get_task_notes(task.id)
+        assert len(notes) == 3
+        assert notes[0]["content"] == "第一条笔记"
+        assert notes[2]["content"] == "第三条笔记"
+
+    def test_get_task_notes_returns_empty_list_when_none(self, tm):
+        """没有笔记时，get_task_notes 应返回空列表"""
+        task = self._make_task(tm)
+        notes = tm.get_task_notes(task.id)
+        assert notes == []
+
+    def test_add_empty_note_raises(self, tm):
+        """添加空内容笔记应抛出 TaskManagerError"""
+        task = self._make_task(tm)
+        with pytest.raises(TaskManagerError):
+            tm.add_task_note(task.id, "   ")
+
+    def test_note_persisted_in_db(self, tm):
+        """笔记应持久化，重新 get_task 后仍可读取"""
+        task = self._make_task(tm)
+        tm.add_task_note(task.id, "持久化测试", note_type="context")
+        reloaded = tm.get_task(task.id)
+        notes = reloaded.test_report.get("task_notes", [])
+        assert len(notes) == 1
+        assert notes[0]["content"] == "持久化测试"
+        assert notes[0]["type"] == "context"
+
 
 
 class TestSubmitEnvelopeRisks:
