@@ -268,4 +268,4 @@ src/cli_anything/
 
 ## 📄 License
 
-MIT
+Apache-2.0

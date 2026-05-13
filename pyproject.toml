@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "跨终端协同任务系统 — 主从终端协同，任务拆解与验收"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 
 dependencies = [
     "typer>=0.9.0",
