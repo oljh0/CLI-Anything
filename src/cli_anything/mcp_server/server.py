@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from typing import Optional
 
 from fastmcp import FastMCP
 
-from cli_anything.core.models import TaskStatus, TaskType, TestStatus, ReviewStatus
+from cli_anything.core.models import (
+    TaskStatus,
+    TaskType,
+    TestStatus,
+    ReviewStatus,
+    Terminal,
+    TerminalRole,
+    _now_iso,
+)
 from cli_anything.core.task_manager import TaskManager, TaskManagerError
 from cli_anything.storage.database import Database
 from cli_anything.utils.config import Config
@@ -20,10 +29,11 @@ _db: Database | None = None
 _config: Config | None = None
 _tm: TaskManager | None = None
 _init_lock = threading.Lock()
+_agent_terminal_id = "mcp-agent"
 
 
 def _init_mcp():
-    global _db, _config, _tm
+    global _db, _config, _tm, _agent_terminal_id
     if _db is not None:
         return
     with _init_lock:
@@ -33,7 +43,26 @@ def _init_mcp():
         _config.load()
         _db = Database(_config.get("database.path"))
         _db.connect()
-        _tm = TaskManager(_db, terminal_id="mcp-agent")
+        _agent_terminal_id = os.environ.get("CLI_ANYTHING_TERMINAL_ID", "mcp-agent")
+        role = os.environ.get("CLI_ANYTHING_TERMINAL_ROLE", "worker")
+        name = os.environ.get("CLI_ANYTHING_TERMINAL_NAME", "MCP Agent")
+        _tm = TaskManager(_db, terminal_id=_agent_terminal_id)
+        existing = _db.get_terminal(_agent_terminal_id)
+        try:
+            terminal_role = TerminalRole(role)
+        except ValueError:
+            terminal_role = TerminalRole.WORKER
+        terminal = Terminal(
+            id=_agent_terminal_id,
+            name=name or (existing.name if existing else "") or "MCP Agent",
+            role=terminal_role,
+            type="mcp",
+            pid=os.getpid(),
+            capabilities=existing.capabilities if existing else [],
+            last_active=_now_iso(),
+            registered_at=existing.registered_at if existing else _now_iso(),
+        )
+        _tm.register_terminal(terminal)
 
 
 def _get_tm() -> TaskManager:
@@ -46,6 +75,11 @@ def _get_db() -> Database:
     _init_mcp()
     assert _db is not None
     return _db
+
+
+def _get_agent_terminal_id() -> str:
+    _init_mcp()
+    return _agent_terminal_id
 
 
 # ── MCP 工具定义 ─────────────────────────────────────────────
@@ -511,6 +545,72 @@ def task_health(
 
 
 @mcp.tool()
+def task_register_terminal(
+    terminal_id: str | None = None,
+    role: str = "worker",
+    name: str = "",
+    capabilities: list[str] | None = None,
+) -> dict:
+    """注册或更新一个终端/Agent
+
+    Args:
+        terminal_id: 终端 ID。留空时注册当前 MCP Agent 终端
+        role: 终端角色，master 或 worker
+        name: 终端显示名称
+        capabilities: 技能/标签列表，用于任务路由
+    """
+    tm = _get_tm()
+    db = _get_db()
+    tid = terminal_id or _get_agent_terminal_id()
+    try:
+        existing = db.get_terminal(tid)
+        terminal = Terminal(
+            id=tid,
+            name=name or (existing.name if existing else "") or tid,
+            role=TerminalRole(role),
+            type="mcp",
+            pid=os.getpid(),
+            capabilities=capabilities if capabilities is not None else (existing.capabilities if existing else []),
+            last_active=_now_iso(),
+            registered_at=existing.registered_at if existing else _now_iso(),
+        )
+        tm.register_terminal(terminal)
+        if terminal_id is None:
+            tm.terminal_id = tid
+        return {
+            "success": True,
+            "terminal": {
+                "id": terminal.id,
+                "name": terminal.name,
+                "role": terminal.role.value,
+                "capabilities": terminal.capabilities,
+            },
+        }
+    except ValueError as e:
+        return {"success": False, "error": f"无效终端角色: {role}"}
+
+
+@mcp.tool()
+def task_update_capabilities(
+    terminal_id: str | None = None,
+    capabilities: list[str] | None = None,
+) -> dict:
+    """更新终端技能列表
+
+    Args:
+        terminal_id: 终端 ID。留空时使用当前 MCP Agent 终端
+        capabilities: 技能/标签列表，与任务 tags 匹配
+    """
+    tm = _get_tm()
+    tid = terminal_id or _get_agent_terminal_id()
+    try:
+        tm.update_capabilities(tid, capabilities or [])
+        return {"success": True, "terminal_id": tid, "capabilities": capabilities or []}
+    except TaskManagerError as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
 def task_judgment_day(task_id: str, project_standards: str = "") -> dict:
     """为 submitted 状态的任务启动双盲对抗审查（Judgment Day）
 
@@ -800,7 +900,7 @@ def task_suggest(terminal_id: str | None = None, limit: int = 10) -> dict:
     tid = terminal_id or _get_agent_terminal_id()
     try:
         tasks = tm.suggest_tasks(tid, limit=limit)
-        return {"ok": True, "tasks": [t.to_dict() for t in tasks]}
+        return {"ok": True, "tasks": [t.to_api_dict() for t in tasks]}
     except TaskManagerError as e:
         return {"ok": False, "error": str(e)}
 

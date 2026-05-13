@@ -27,6 +27,7 @@ _db: Database | None = None
 _tm: TaskManager | None = None
 _config: Config | None = None
 _ws_clients: set[WebSocket] = set()
+_ws_tokens: set[str] = set()
 
 
 def _init_web():
@@ -107,6 +108,11 @@ async def broadcast(event: str, data: dict):
 
 @web_app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    if _config is not None and _config.get("dashboard.auth.enabled", False):
+        token = ws.query_params.get("token", "")
+        if not token or token not in _ws_tokens:
+            await ws.close(code=1008)
+            return
     await ws.accept()
     _ws_clients.add(ws)
     try:
@@ -131,7 +137,7 @@ def api_list_tasks(
         status=status, task_type=task_type,
         parent_id=parent_id, tag=tag, limit=limit,
     )
-    return [t.to_dict() for t in tasks]
+    return [t.to_api_dict() for t in tasks]
 
 
 @web_app.get("/api/tasks/{task_id}")
@@ -140,10 +146,10 @@ def api_get_task(task_id: str):
     task = tm.get_task(task_id)
     if not task:
         return JSONResponse({"error": "not found"}, 404)
-    result = task.to_dict()
+    result = task.to_api_dict()
     subtasks = tm.list_subtasks(task_id)
     if subtasks:
-        result["subtasks"] = [s.to_dict() for s in subtasks]
+        result["subtasks"] = [s.to_api_dict() for s in subtasks]
         result["progress"] = tm.get_progress(task_id)
     return result
 
@@ -158,7 +164,7 @@ def api_task_logs(task_id: str, limit: int = Query(30)):
 @web_app.get("/api/terminals")
 def api_list_terminals():
     tm = _get_tm()
-    return [t.to_dict() for t in tm.list_terminals()]
+    return [t.to_api_dict() for t in tm.list_terminals()]
 
 
 @web_app.get("/api/dashboard/summary")
@@ -183,6 +189,14 @@ def api_summary():
     }
 
 
+@web_app.get("/api/ws-token")
+def api_ws_token():
+    """签发 WebSocket 连接 token（HTTP Basic Auth 开启时由中间件保护）"""
+    token = secrets.token_urlsafe(32)
+    _ws_tokens.add(token)
+    return {"token": token}
+
+
 # ── 任务操作 API ─────────────────────────────────────────────
 
 @web_app.post("/api/tasks/{task_id}/claim")
@@ -191,8 +205,8 @@ async def api_claim_task(task_id: str):
     tm = _get_tm()
     try:
         task = tm.claim_task(task_id)
-        await broadcast("task_updated", task.to_dict())
-        return task.to_dict()
+        await broadcast("task_updated", task.to_api_dict())
+        return task.to_api_dict()
     except TaskManagerError as e:
         return JSONResponse({"error": str(e)}, 400)
 
@@ -203,8 +217,8 @@ async def api_submit_task(task_id: str):
     tm = _get_tm()
     try:
         task = tm.submit_task(task_id)
-        await broadcast("task_updated", task.to_dict())
-        return task.to_dict()
+        await broadcast("task_updated", task.to_api_dict())
+        return task.to_api_dict()
     except TaskManagerError as e:
         return JSONResponse({"error": str(e)}, 400)
 
@@ -219,8 +233,8 @@ async def api_verify_task(
     tm = _get_tm()
     try:
         task = tm.verify_task(task_id, approved=approved, comment=comment)
-        await broadcast("task_updated", task.to_dict())
-        return task.to_dict()
+        await broadcast("task_updated", task.to_api_dict())
+        return task.to_api_dict()
     except TaskManagerError as e:
         return JSONResponse({"error": str(e)}, 400)
 
@@ -237,8 +251,8 @@ async def api_review_task(
     tm = _get_tm()
     try:
         task = tm.review_task(task_id, approved=approved, comment=comment)
-        await broadcast("task_updated", task.to_dict())
-        return task.to_dict()
+        await broadcast("task_updated", task.to_api_dict())
+        return task.to_api_dict()
     except TaskManagerError as e:
         return JSONResponse({"error": str(e)}, 400)
 
@@ -249,8 +263,8 @@ async def api_resubmit_review(task_id: str):
     tm = _get_tm()
     try:
         task = tm.resubmit_for_review(task_id)
-        await broadcast("task_updated", task.to_dict())
-        return task.to_dict()
+        await broadcast("task_updated", task.to_api_dict())
+        return task.to_api_dict()
     except TaskManagerError as e:
         return JSONResponse({"error": str(e)}, 400)
 
@@ -369,7 +383,7 @@ async function loadKanban(){
     const color=STATUS_COLORS[s];
     html+=`<div class="column"><h3><span class="dot" style="background:${color}"></span>${STATUS_LABELS[s]} (${cols[s].length})</h3>`;
     cols[s].forEach(t=>{
-      const tags=(JSON.parse(t.tags||'[]')).map(g=>`<span class="tag">${g}</span>`).join('');
+      const tags=(t.tags||[]).map(g=>`<span class="tag">${g}</span>`).join('');
       const reviewer=t.reviewer?`<span class="tag">🔍${t.reviewer}</span>`:'';
       html+=`<div class="task-card priority-${t.priority}">
         <div class="title">${PRIORITY_LABELS[t.priority]||''} ${t.title}</div>
@@ -397,8 +411,12 @@ async function loadLogs(){
   document.getElementById('logs').innerHTML=html||'<div style="color:var(--muted)">暂无日志</div>';
 }
 
-function connectWS(){
-  const ws=new WebSocket(`ws://${location.host}/ws`);
+async function connectWS(){
+  let token='';
+  try{const t=await fetchJSON('/api/ws-token');token=t.token||''}catch(e){}
+  const scheme=location.protocol==='https:'?'wss':'ws';
+  const suffix=token?`?token=${encodeURIComponent(token)}`:'';
+  const ws=new WebSocket(`${scheme}://${location.host}/ws${suffix}`);
   const dot=document.getElementById('ws-status');
   ws.onopen=()=>{dot.className='connected';dot.title='WebSocket 已连接'};
   ws.onclose=()=>{dot.className='';dot.title='WebSocket 未连接';setTimeout(connectWS,3000)};

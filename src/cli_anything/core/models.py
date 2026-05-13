@@ -115,6 +115,15 @@ class Task:
         d["test_report"] = json.dumps(self.test_report, ensure_ascii=False)
         return d
 
+    def to_api_dict(self) -> dict:
+        """转换为面向 API/CLI JSON 的字典（保留结构化字段）"""
+        d = asdict(self)
+        d["status"] = self.status.value
+        d["task_type"] = self.task_type.value
+        d["test_status"] = self.test_status.value
+        d["review_status"] = self.review_status.value
+        return d
+
     @classmethod
     def from_row(cls, row: dict) -> Task:
         """从数据库行字典创建 Task 实例"""
@@ -201,6 +210,12 @@ class Terminal:
         d = asdict(self)
         d["role"] = self.role.value
         d["capabilities"] = json.dumps(self.capabilities, ensure_ascii=False)
+        return d
+
+    def to_api_dict(self) -> dict:
+        """转换为面向 API/CLI JSON 的字典（保留 capabilities 列表）"""
+        d = asdict(self)
+        d["role"] = self.role.value
         return d
 
     @classmethod

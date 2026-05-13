@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from cli_anything.core.models import Terminal, TerminalRole, _now_iso
@@ -18,28 +19,46 @@ class TerminalManager:
         self.config = config
         self._current: Optional[Terminal] = None
 
-    def register_current(self) -> Terminal:
+    def register_current(
+        self,
+        role: Optional[str] = None,
+        name: Optional[str] = None,
+        terminal_id: Optional[str] = None,
+        capabilities: Optional[list[str]] = None,
+        persist_id: bool = False,
+    ) -> Terminal:
         """注册当前终端，返回 Terminal 实例"""
         cfg = self.config.data.get("terminal", {})
-        terminal_id = cfg.get("id") or generate_terminal_id()
-        role_str = cfg.get("role", "worker")
-        name = cfg.get("name", "")
+        env_id = os.environ.get("CLI_ANYTHING_TERMINAL_ID", "")
+        env_role = os.environ.get("CLI_ANYTHING_TERMINAL_ROLE", "")
+        env_name = os.environ.get("CLI_ANYTHING_TERMINAL_NAME", "")
+
+        terminal_id = terminal_id or env_id or cfg.get("id") or generate_terminal_id()
+        role_str = role or env_role or cfg.get("role", "worker")
+        terminal_name = name or env_name or cfg.get("name", "")
+        existing = self.db.get_terminal(terminal_id)
 
         terminal = Terminal(
             id=terminal_id,
-            name=name or f"{role_str}-{terminal_id[:4]}",
+            name=terminal_name or (existing.name if existing else "") or f"{role_str}-{terminal_id[:4]}",
             role=TerminalRole(role_str),
             type=detect_terminal_type(),
             pid=get_current_pid(),
+            capabilities=capabilities if capabilities is not None else (existing.capabilities if existing else []),
             last_active=_now_iso(),
+            registered_at=existing.registered_at if existing else _now_iso(),
         )
 
         self.db.upsert_terminal(terminal)
         self._current = terminal
 
         # 持久化终端 ID 到配置
-        if not cfg.get("id"):
+        if persist_id or (not cfg.get("id") and not env_id):
             self.config.set("terminal.id", terminal_id)
+        if persist_id and role:
+            self.config.set("terminal.role", role)
+        if persist_id and name:
+            self.config.set("terminal.name", name)
 
         return terminal
 

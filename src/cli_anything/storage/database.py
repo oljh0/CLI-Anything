@@ -147,7 +147,10 @@ class Database:
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
         self._local = threading.local()
-        self._lock = threading.Lock()
+        self._schema_lock = threading.Lock()
+        self._write_lock = threading.RLock()
+        self._connections_lock = threading.Lock()
+        self._connections: list[sqlite3.Connection] = []
         self._schema_initialized = False
 
     def connect(self) -> sqlite3.Connection:
@@ -164,6 +167,7 @@ class Database:
         conn = sqlite3.connect(
             self.db_path,
             timeout=SQLITE_CONNECT_TIMEOUT,
+            check_same_thread=False,
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -175,7 +179,7 @@ class Database:
         conn.execute("PRAGMA temp_store=MEMORY")  # 排序/JOIN 临时表放内存，减少 I/O
 
         # 首次连接时初始化表结构（全局只做一次）
-        with self._lock:
+        with self._schema_lock:
             if not self._schema_initialized:
                 conn.executescript(_SCHEMA_SQL)
                 conn.commit()
@@ -184,6 +188,8 @@ class Database:
                 self._schema_initialized = True
 
         self._local.conn = conn
+        with self._connections_lock:
+            self._connections.append(conn)
         return conn
 
     def _migrate_review_columns_on(self, conn: sqlite3.Connection):
@@ -222,11 +228,16 @@ class Database:
         conn.commit()
 
     def close(self):
-        """关闭当前线程的数据库连接"""
-        conn = getattr(self._local, "conn", None)
-        if conn:
-            conn.close()
-            self._local.conn = None
+        """关闭该 Database 实例创建过的所有线程连接"""
+        with self._connections_lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for conn in connections:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        self._local.conn = None
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -236,19 +247,21 @@ class Database:
             return self.connect()
         return conn
 
+    @retry_on_lock
     def execute_in_transaction(self, operations: list[tuple[str, list]]) -> None:
         """在单个事务中执行多个操作（线程安全）
         
         Args:
             operations: 操作列表，每项为 (sql, params)
         """
-        with self._lock:
+        conn = self.conn
+        with self._write_lock:
             try:
                 for sql, params in operations:
-                    self.conn.execute(sql, params)
-                self.conn.commit()
+                    conn.execute(sql, params)
+                conn.commit()
             except Exception:
-                self.conn.rollback()
+                conn.rollback()
                 raise
 
     @retry_on_lock
@@ -268,15 +281,16 @@ class Database:
     @retry_on_lock
     def insert_task(self, task: Task) -> Task:
         """插入新任务"""
-        with self._lock:
+        conn = self.conn
+        with self._write_lock:
             d = task.to_dict()
             cols = ", ".join(d.keys())
             placeholders = ", ".join(["?"] * len(d))
-            self.conn.execute(
+            conn.execute(
                 f"INSERT INTO tasks ({cols}) VALUES ({placeholders})",
                 list(d.values()),
             )
-            self.conn.commit()
+            conn.commit()
         return task
 
     def get_task(self, task_id: str) -> Optional[Task]:
@@ -327,22 +341,26 @@ class Database:
     def update_task(self, task: Task) -> Task:
         """更新任务（按 ID）"""
         from datetime import datetime
-        with self._lock:
+        conn = self.conn
+        with self._write_lock:
             task.updated_at = datetime.now().isoformat(timespec="seconds")
             d = task.to_dict()
             task_id = d.pop("id")
             set_clause = ", ".join(f"{k} = ?" for k in d.keys())
-            self.conn.execute(
+            conn.execute(
                 f"UPDATE tasks SET {set_clause} WHERE id = ?",
                 [*d.values(), task_id],
             )
-            self.conn.commit()
+            conn.commit()
         return task
 
+    @retry_on_lock
     def delete_task(self, task_id: str) -> bool:
         """删除任务（级联删除子任务和日志）"""
-        cur = self.conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        self.conn.commit()
+        conn = self.conn
+        with self._write_lock:
+            cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            conn.commit()
         return cur.rowcount > 0
 
     def count_subtasks_by_status(self, parent_id: str) -> dict[str, int]:
@@ -358,15 +376,16 @@ class Database:
     @retry_on_lock
     def insert_log(self, log: TaskLog) -> TaskLog:
         """插入操作日志"""
-        with self._lock:
+        conn = self.conn
+        with self._write_lock:
             d = log.to_dict()
             cols = ", ".join(d.keys())
             placeholders = ", ".join(["?"] * len(d))
-            cur = self.conn.execute(
+            cur = conn.execute(
                 f"INSERT INTO task_logs ({cols}) VALUES ({placeholders})",
                 list(d.values()),
             )
-            self.conn.commit()
+            conn.commit()
             log.id = cur.lastrowid
         return log
 
@@ -401,17 +420,18 @@ class Database:
     @retry_on_lock
     def upsert_terminal(self, terminal: Terminal) -> Terminal:
         """插入或更新终端信息"""
-        with self._lock:
+        conn = self.conn
+        with self._write_lock:
             d = terminal.to_dict()
             cols = ", ".join(d.keys())
             placeholders = ", ".join(["?"] * len(d))
             update_set = ", ".join(f"{k} = excluded.{k}" for k in d.keys() if k != "id")
-            self.conn.execute(
+            conn.execute(
                 f"INSERT INTO terminals ({cols}) VALUES ({placeholders}) "
                 f"ON CONFLICT(id) DO UPDATE SET {update_set}",
                 list(d.values()),
             )
-            self.conn.commit()
+            conn.commit()
         return terminal
 
     def get_terminal(self, terminal_id: str) -> Optional[Terminal]:
@@ -430,22 +450,24 @@ class Database:
     @retry_on_lock
     def add_dependency(self, task_id: str, depends_on: str) -> None:
         """添加任务依赖关系（幂等）"""
-        with self._lock:
-            self.conn.execute(
+        conn = self.conn
+        with self._write_lock:
+            conn.execute(
                 "INSERT OR IGNORE INTO task_deps (task_id, depends_on) VALUES (?, ?)",
                 (task_id, depends_on),
             )
-            self.conn.commit()
+            conn.commit()
 
     @retry_on_lock
     def remove_dependency(self, task_id: str, depends_on: str) -> bool:
         """删除任务依赖关系，返回是否删除了记录"""
-        with self._lock:
-            cur = self.conn.execute(
+        conn = self.conn
+        with self._write_lock:
+            cur = conn.execute(
                 "DELETE FROM task_deps WHERE task_id = ? AND depends_on = ?",
                 (task_id, depends_on),
             )
-            self.conn.commit()
+            conn.commit()
         return cur.rowcount > 0
 
     def get_tasks_by_ids(self, ids: list[str]) -> dict[str, "Task"]:

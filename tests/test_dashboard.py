@@ -1,7 +1,6 @@
 """Dashboard Basic Auth 和 REST API 测试"""
 
 import base64
-import sqlite3
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -19,13 +18,6 @@ def db(tmp_path):
     db_path = str(tmp_path / "test.db")
     database = Database(db_path)
     database.connect()
-    # 允许跨线程使用（TestClient 在不同线程中运行请求）
-    database._conn.close()
-    database._conn = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False)
-    database._conn.row_factory = sqlite3.Row
-    database._conn.execute("PRAGMA journal_mode=WAL")
-    database._conn.execute("PRAGMA foreign_keys=ON")
-    database._conn.execute("PRAGMA busy_timeout=5000")
     yield database
     database.close()
 
@@ -50,6 +42,7 @@ def client(db, tm):
     dash._db = None
     dash._tm = None
     dash._config = None
+    dash._ws_tokens.clear()
 
 
 @pytest.fixture
@@ -69,6 +62,7 @@ def auth_client(db, tm):
     dash._db = None
     dash._tm = None
     dash._config = None
+    dash._ws_tokens.clear()
 
 
 def _basic_auth(username: str, password: str) -> dict:
@@ -106,6 +100,17 @@ class TestDashboardAuth:
         resp = auth_client.get("/api/tasks", headers=_basic_auth("admin", "secret123"))
         assert resp.status_code == 200
 
+    def test_ws_token_requires_auth(self, auth_client):
+        """认证启用时 WebSocket token 端点也需要凭据"""
+        resp = auth_client.get("/api/ws-token")
+        assert resp.status_code == 401
+
+    def test_ws_token_with_auth(self, auth_client):
+        """认证通过后可获取 WebSocket token"""
+        resp = auth_client.get("/api/ws-token", headers=_basic_auth("admin", "secret123"))
+        assert resp.status_code == 200
+        assert resp.json()["token"]
+
     def test_auth_invalid_base64(self, auth_client):
         """无效 Base64 应返回 401"""
         resp = auth_client.get("/api/tasks", headers={"Authorization": "Basic !!!invalid!!!"})
@@ -123,12 +128,13 @@ class TestDashboardRESTApi:
 
     def test_get_tasks_with_data(self, client, tm):
         """有任务时应返回任务列表"""
-        tm.create_task("测试任务1")
+        tm.create_task("测试任务1", tags=["api", "dashboard"])
         tm.create_task("测试任务2")
         resp = client.get("/api/tasks")
         assert resp.status_code == 200
         data = resp.json()
         assert len(data) == 2
+        assert all(isinstance(item["tags"], list) for item in data)
 
     def test_get_task_detail(self, client, tm):
         """GET /api/tasks/{id} 应返回任务详情"""

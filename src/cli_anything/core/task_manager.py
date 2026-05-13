@@ -431,6 +431,8 @@ class TaskManager:
             task.description = description.strip()
             changes.append("description 已更新")
         if priority is not None:
+            if priority < 1 or priority > 5:
+                raise TaskManagerError("优先级必须在 1-5 之间")
             task.priority = priority
             changes.append(f"priority={priority}")
         if tags is not None:

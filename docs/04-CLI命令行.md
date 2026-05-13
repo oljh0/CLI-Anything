@@ -484,7 +484,7 @@ task resubmit-review TASK_ID [--reviewer NEW_TERMINAL_ID]
 #### `list` — 列出任务
 
 ```bash
-task list [--status pending] [--type subtask] [--parent PARENT_ID] [--tag "标签"]
+task list [--status pending] [--type subtask] [--parent PARENT_ID] [--tag "标签"] [--json]
 ```
 
 | 参数 | 短选项 | 类型 | 默认值 | 说明 |
@@ -939,6 +939,8 @@ stateDiagram-v2
 
 | 命令 | 角色 | 简要说明 | 最小用法 |
 |------|------|----------|----------|
+| `register` | 所有 | 注册当前终端 | `task register --role worker` |
+| `heartbeat` | 所有 | 发送当前终端心跳 | `task heartbeat` |
 | `init` | 所有 | 初始化配置与数据库 | `task init` |
 | `create` | Master | 创建任务 | `task create "标题"` |
 | `decompose` | Master | 拆解子任务 | `task decompose PID '[...]'` |
@@ -951,7 +953,8 @@ stateDiagram-v2
 | `verify` | Master | 验收任务 | `task verify TID` |
 | `review` | 审阅者 | 审阅草稿任务 | `task review TID --approve` |
 | `resubmit-review` | Master | 重新提交审阅 | `task resubmit-review TID` |
-| `list` | 所有 | 列出任务 | `task list` |
+| `list` / `ls` | 所有 | 列出任务 | `task list --json` |
+| `change-status` | 所有 | 通用状态变更 | `task change-status TID blocked` |
 | `show` | 所有 | 查看任务详情 | `task show TID` |
 | `progress` | 所有 | 查看主任务进度 | `task progress PID` |
 | `log` | 所有 | 查看操作日志 | `task log` |
@@ -965,6 +968,8 @@ stateDiagram-v2
 | `dashboard` | 所有 | 启动 Web 看板 | `task dashboard` |
 | `tui` | 所有 | 启动 TUI 界面 | `task tui` |
 | `health` | 所有 | 健康检查 | `task health` |
+| `config` | 所有 | 查看或修改配置 | `task config show` |
+| `version` | 所有 | 查看版本 | `task version` |
 
 ---
 

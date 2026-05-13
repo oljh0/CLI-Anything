@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import copy
 from pathlib import Path
 from typing import Any, Optional
 
@@ -13,6 +14,7 @@ import yaml
 # 默认配置目录
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".cli-anything")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.yaml")
+CONFIG_ENV_VAR = "CLI_ANYTHING_CONFIG"
 # 项目内示例配置的可能路径
 _EXAMPLE_CONFIG_CANDIDATES = [
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "config", "config.example.yaml"),
@@ -72,12 +74,12 @@ _DEFAULT_CONFIG: dict[str, Any] = {
 
 def _deep_merge(base: dict, override: dict) -> dict:
     """深度合并两个字典，override 覆盖 base"""
-    result = base.copy()
+    result = copy.deepcopy(base)
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = _deep_merge(result[key], value)
         else:
-            result[key] = value
+            result[key] = copy.deepcopy(value)
     return result
 
 
@@ -85,13 +87,15 @@ class Config:
     """CLI-Anything 配置管理器"""
 
     def __init__(self, config_path: Optional[str] = None):
-        self.config_path = config_path or CONFIG_FILE
+        self.config_path = os.path.expanduser(
+            config_path or os.environ.get(CONFIG_ENV_VAR, CONFIG_FILE)
+        )
         self._data: dict[str, Any] = {}
         self._loaded = False
 
     def load(self) -> dict[str, Any]:
         """加载配置文件，与默认值合并"""
-        self._data = _DEFAULT_CONFIG.copy()
+        self._data = copy.deepcopy(_DEFAULT_CONFIG)
 
         if os.path.exists(self.config_path):
             with open(self.config_path, "r", encoding="utf-8") as f:
@@ -137,7 +141,9 @@ class Config:
 
     def save(self) -> None:
         """保存配置到文件"""
-        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        config_dir = os.path.dirname(self.config_path)
+        if config_dir:
+            os.makedirs(config_dir, exist_ok=True)
         with open(self.config_path, "w", encoding="utf-8") as f:
             yaml.dump(
                 self._data,
@@ -149,7 +155,9 @@ class Config:
 
     def init_config(self, role: str = "worker", name: str = "") -> str:
         """初始化配置文件（首次使用），返回配置文件路径"""
-        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        config_dir = os.path.dirname(self.config_path)
+        if config_dir:
+            os.makedirs(config_dir, exist_ok=True)
 
         if not os.path.exists(self.config_path):
             # 尝试复制示例配置
@@ -162,7 +170,7 @@ class Config:
                     break
             if not copied:
                 # 使用默认配置
-                self._data = _DEFAULT_CONFIG.copy()
+                self._data = copy.deepcopy(_DEFAULT_CONFIG)
 
         self.load()
         if role:

@@ -8,11 +8,13 @@ import sys
 from typing import Optional
 
 import typer
+import yaml
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 
+from cli_anything import __version__
 from cli_anything.core.models import TaskStatus, TaskType, TestStatus, ReviewStatus, TerminalRole
 from cli_anything.core.task_manager import TaskManager, TaskManagerError
 from cli_anything.core.terminal_manager import TerminalManager
@@ -26,6 +28,9 @@ app = typer.Typer(
     help="跨终端协同任务系统 — Master/Worker 协同开发",
     no_args_is_help=True,
 )
+
+config_app = typer.Typer(help="查看和修改配置")
+app.add_typer(config_app, name="config")
 
 console = Console()
 
@@ -122,7 +127,49 @@ def _select_reviewer() -> Optional[str]:
         return None
 
 
-# ── init 命令 ───────────────────────────────────────────────
+# ── 终端注册与 init 命令 ─────────────────────────────────────
+
+@app.command()
+def register(
+    role: str = typer.Option("worker", help="终端角色: master / worker"),
+    name: str = typer.Option("", help="终端名称"),
+    terminal_id: Optional[str] = typer.Option(None, "--id", help="终端 ID（留空自动生成）"),
+    capabilities: Optional[str] = typer.Option(None, "--capabilities", help="技能/标签，逗号分隔"),
+):
+    """注册当前终端"""
+    config = Config()
+    config.load()
+    db = Database(config.get("database.path"))
+    db.connect()
+    term_mgr = TerminalManager(db, config)
+    cap_list = [c.strip() for c in capabilities.split(",") if c.strip()] if capabilities else None
+    try:
+        terminal = term_mgr.register_current(
+            role=role,
+            name=name,
+            terminal_id=terminal_id,
+            capabilities=cap_list,
+            persist_id=True,
+        )
+        console.print(
+            f"[green]✓[/green] 终端已注册: [bold]{terminal.id}[/bold] "
+            f"({terminal.role.value}) — {terminal.name}"
+        )
+        if terminal.capabilities:
+            console.print(f"  能力: {', '.join(terminal.capabilities)}")
+    except ValueError as e:
+        console.print(f"[red]✗[/red] 无效终端角色: {role}")
+        raise typer.Exit(1) from e
+    finally:
+        db.close()
+
+
+@app.command()
+def heartbeat():
+    """发送当前终端心跳"""
+    term_mgr = _get_term_mgr()
+    term_mgr.heartbeat()
+    console.print(f"[green]✓[/green] 心跳已更新: {term_mgr.current.id}")
 
 @app.command()
 def init(
@@ -142,7 +189,7 @@ def init(
 
     # 注册终端
     tm = TerminalManager(db, config)
-    t = tm.register_current()
+    t = tm.register_current(role=role, name=name, persist_id=True)
     console.print(f"[green]✓[/green] 终端已注册: {t.id} ({t.role.value})")
     db.close()
 
@@ -209,12 +256,14 @@ def decompose(
         raise typer.Exit(1)
 
 
+@app.command(name="ls")
 @app.command(name="list")
 def list_tasks(
     status: Optional[str] = typer.Option(None, "--status", "-s", help="按状态过滤"),
-    task_type: Optional[str] = typer.Option(None, "--type", help="按类型过滤: master/subtask"),
+    task_type: Optional[str] = typer.Option(None, "--type", help="按类型过滤: master/subtask/review"),
     parent: Optional[str] = typer.Option(None, "--parent", help="按父任务 ID 过滤"),
     tag: Optional[str] = typer.Option(None, "--tag", help="按标签过滤"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON"),
 ):
     """列出任务"""
     tm = _get_tm()
@@ -224,6 +273,10 @@ def list_tasks(
         parent_id=parent,
         tag=tag,
     )
+
+    if json_output:
+        console.print(json.dumps([t.to_api_dict() for t in tasks], ensure_ascii=False, indent=2))
+        return
 
     if not tasks:
         console.print("[dim]没有匹配的任务[/dim]")
@@ -392,17 +445,25 @@ def resubmit_review(
 @app.command()
 def submit(
     task_id: str = typer.Argument(..., help="任务 ID"),
-    run_test: bool = typer.Option(True, "--test/--no-test", help="提交前是否运行测试"),
+    run_test: Optional[bool] = typer.Option(None, "--test/--no-test", help="提交前是否运行测试"),
+    summary: str = typer.Option("", "--summary", help="实现内容摘要"),
+    changed_files: Optional[str] = typer.Option(None, "--changed-files", help="修改文件，逗号分隔"),
+    test_note: str = typer.Option("", "--test-note", help="测试说明"),
+    risks: str = typer.Option("", "--risks", help="风险或副作用说明"),
 ):
     """提交任务（Worker）"""
     tm = _get_tm()
+    should_run_test = run_test
+    if should_run_test is None:
+        assert _config is not None
+        should_run_test = _config.get("testing.auto_run_on_submit", True)
     task = tm.get_task(task_id)
     if not task:
         console.print(f"[red]✗[/red] 任务 {task_id} 不存在")
         raise typer.Exit(1)
 
     # 运行测试
-    if run_test and task.test_path:
+    if should_run_test and task.test_path:
         console.print("[cyan]🧪 运行测试中...[/cyan]")
         report = run_tests_simple(task.test_path, task.work_dir or None)
         test_status = TestStatus.PASSED if report.success else TestStatus.FAILED
@@ -416,7 +477,14 @@ def submit(
                 raise typer.Exit(0)
 
     try:
-        tm.submit_task(task_id)
+        files = [f.strip() for f in changed_files.split(",") if f.strip()] if changed_files else None
+        tm.submit_task(
+            task_id,
+            summary=summary,
+            changed_files=files,
+            test_note=test_note,
+            risks=risks,
+        )
         console.print(f"[magenta]📤[/magenta] 任务已提交: {task_id}")
     except TaskManagerError as e:
         console.print(f"[red]✗[/red] {e}")
@@ -437,6 +505,26 @@ def verify(
             console.print(f"[green]✓[/green] 已验收通过: {task_id}")
         else:
             console.print(f"[red]↩[/red] 已驳回: {task_id} — {comment}")
+    except TaskManagerError as e:
+        console.print(f"[red]✗[/red] {e}")
+        raise typer.Exit(1)
+
+
+@app.command(name="change-status")
+def change_status(
+    task_id: str = typer.Argument(..., help="任务 ID"),
+    status: str = typer.Argument(..., help="新状态"),
+):
+    """按状态机规则变更任务状态"""
+    tm = _get_tm()
+    try:
+        new_status = TaskStatus(status)
+        task = tm.change_status(task_id, new_status)
+        console.print(f"[green]✓[/green] 状态已更新: {task.id} → {task.status.value}")
+    except ValueError as e:
+        valid = ", ".join(s.value for s in TaskStatus)
+        console.print(f"[red]✗[/red] 无效状态: {status}。可选: {valid}")
+        raise typer.Exit(1) from e
     except TaskManagerError as e:
         console.print(f"[red]✗[/red] {e}")
         raise typer.Exit(1)
@@ -501,11 +589,13 @@ def available():
 
 
 @app.command()
-def my():
+def my(
+    status: Optional[str] = typer.Option(None, "--status", "-s", help="按状态过滤"),
+):
     """查看我领取的任务（Worker）"""
     tm = _get_tm()
     term_mgr = _get_term_mgr()
-    tasks = tm.list_tasks(claimed_by=term_mgr.current.id)
+    tasks = tm.list_tasks(claimed_by=term_mgr.current.id, status=status)
     if not tasks:
         console.print("[dim]你还没有领取任何任务[/dim]")
         return
@@ -717,6 +807,47 @@ def health(
                 console.print(f"  • {r['task_id']} — {r['title']}")
         else:
             console.print("[dim]没有需要释放的任务[/dim]")
+
+
+@app.command()
+def version():
+    """显示版本信息"""
+    console.print(f"cli-anything {__version__}")
+
+
+@config_app.command(name="show")
+def config_show():
+    """显示完整配置"""
+    config = Config()
+    data = config.load()
+    console.print(yaml.safe_dump(data, allow_unicode=True, sort_keys=False))
+
+
+@config_app.command(name="get")
+def config_get(
+    key: str = typer.Argument(..., help="配置键，如 database.path"),
+):
+    """读取配置项"""
+    config = Config()
+    value = config.get(key)
+    if value is None:
+        raise typer.Exit(1)
+    if isinstance(value, (dict, list)):
+        console.print(yaml.safe_dump(value, allow_unicode=True, sort_keys=False))
+    else:
+        console.print(str(value))
+
+
+@config_app.command(name="set")
+def config_set(
+    key: str = typer.Argument(..., help="配置键，如 terminal.role"),
+    value: str = typer.Argument(..., help="配置值，支持 YAML 标量/列表/对象"),
+):
+    """写入配置项"""
+    config = Config()
+    parsed = yaml.safe_load(value)
+    config.set(key, parsed)
+    console.print(f"[green]✓[/green] 已设置 {key}")
 
 
 # ── 入口 ────────────────────────────────────────────────────
